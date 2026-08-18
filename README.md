@@ -370,6 +370,65 @@ With it installed, the path-planning tests run:
 pytest -m rvg
 ```
 
+### DynamicRVG simulation
+
+`examples/dynamic_rvg_simulation.py` runs a persistent DynamicRVG session
+against `SimEnv` and the normal `NavigationController`. It updates the planner
+from simulated pose observations, executes each temporary segment through the
+differential-drive model, and lets the controller decide when the final goal
+is reached.
+
+```bash
+python examples/dynamic_rvg_simulation.py
+```
+
+Add `--gui` for a live MicroMVP canvas:
+
+```bash
+python examples/dynamic_rvg_simulation.py --gui
+```
+
+The GUI shows the simulated scan boundary, obstacle geometry, current and
+previous DRVG segments, controller target, measured trajectory, temporary
+goal, and final goal heading. Click the canvas to plan to a new goal from the
+current robot pose. Press `R` to restart, `Space` to pause, or `Escape` to
+close the simulation.
+
+If the RVG extension was built in a checkout rather than installed, add its
+build directory to `PYTHONPATH`:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_simulation.py
+```
+
+The run writes `trajectory.png` and one planner graph per planning step under
+`simulation_output/dynamic_rvg/`.
+
+### DynamicRVG on real hardware
+
+`examples/dynamic_rvg_navigation.py` uses the same persistent planner with
+`RealEnv`. At startup it captures one fixed obstacle snapshot from the ArUco
+observer. During a run, every measured robot pose is passed to DynamicRVG, one
+temporary segment is executed at a time, and the frontend acknowledges a
+segment only after the normal navigation controller reaches its position and
+terminal heading.
+
+Run it from the MicroMVP checkout with the DRVG extension installed or on
+`PYTHONPATH`:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation.py \
+  --config config/car_v4.yaml
+```
+
+The robot remains stopped until you click a goal on the GUI canvas. Enter a
+goal heading before clicking if needed. `Space` or `C` immediately stops the
+robot and cancels the run; `O` stops the robot and replaces the fixed obstacle
+snapshot. Camera tracking loss and any planner failure also produce a stop
+command. By default, per-step planner graphs are written beneath
+`navigation_output/dynamic_rvg/`; pass `--no-planner-drawings` to disable
+them.
+
 ---
 
 ## Camera calibration

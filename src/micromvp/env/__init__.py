@@ -12,7 +12,6 @@ and applies wheel commands, without knowing anything about control logic.
 
 from .base import Environment
 from .sim_env import SimConfig, SimEnv
-from .real_env import RealEnv
 
 __all__ = [
     "Environment",
@@ -20,3 +19,11 @@ __all__ = [
     "SimEnv",
     "RealEnv",
 ]
+
+
+def __getattr__(name: str):
+    if name == "RealEnv":
+        from .real_env import RealEnv
+
+        return RealEnv
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
