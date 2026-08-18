@@ -13,6 +13,25 @@ from micromvp.core.models import Point, Pose, RobotObservation, WorkspaceConfig
 
 PolygonPoints = Sequence[Point]
 
+TEMPORARY_GOAL_STRATEGIES = (
+    "greedy",
+    "quadtree",
+    "astar",
+    "information",
+    "quadtree_astar",
+    "quadtree_frontier_astar",
+    "quadtree_information",
+    "astar_information",
+    "quadtree_frontier_astar_information",
+)
+PLANNER_MODES = (
+    "graph_merge",
+    "delta_graph_merge",
+    "buffered_delta_graph_merge",
+    "incremental",
+)
+SCAN_MODES = ("center", "footprint")
+
 
 @dataclass(frozen=True, slots=True)
 class DynamicRVGSettings:
@@ -20,10 +39,15 @@ class DynamicRVGSettings:
 
     resolution: int = 36
     num_threads: int = 1
+    strategy: str = "quadtree"
+    planner_mode: str = "graph_merge"
+    scan_mode: str = "center"
+    max_iterations: int = 10000
     euclidean_weight: float = 1.0
     rotational_weight: float = 0.1
     minimum_leaf_width_scale: float = 1.0
     bucket_capacity: int = 32
+    information_weight: float = 1.0
     robot_geometry_scale: float = 1.2
 
 
@@ -104,9 +128,59 @@ class DynamicRVGSession:
         self._planner.setWeight(
             settings.euclidean_weight, settings.rotational_weight
         )
-        self._planner.setQuadtreeOptions(
-            settings.minimum_leaf_width_scale, settings.bucket_capacity
+        temporary_goal_options = self._temporary_goal_options(settings)
+        if not self._planner.setTemporaryGoalOptions(temporary_goal_options):
+            raise RuntimeError("DynamicRVG rejected temporary-goal options")
+        planner_mode = self._planner_mode(settings.planner_mode)
+        if not self._planner.setPlannerMode(planner_mode):
+            raise RuntimeError("DynamicRVG rejected planner mode")
+        self._scan_mode = self._scan_mode_value(settings.scan_mode)
+
+    def _temporary_goal_options(
+        self, settings: DynamicRVGSettings
+    ) -> Any:
+        if settings.strategy not in TEMPORARY_GOAL_STRATEGIES:
+            raise ValueError(
+                f"unsupported DynamicRVG strategy: {settings.strategy}"
+            )
+        options = self._rvg.TemporaryGoalOptions()
+        options.useQuadtree = settings.strategy.startswith("quadtree")
+        options.scoreMode = (
+            self._rvg.TemporaryGoalScoreMode.AStar
+            if "astar" in settings.strategy
+            else self._rvg.TemporaryGoalScoreMode.GoalGreedy
         )
+        options.useFrontierCandidates = "frontier" in settings.strategy
+        options.useInformationGain = "information" in settings.strategy
+        options.minimumLeafWidthScale = settings.minimum_leaf_width_scale
+        options.bucketCapacity = settings.bucket_capacity
+        options.informationWeight = settings.information_weight
+        options.maxIterations = settings.max_iterations
+        return options
+
+    def _planner_mode(self, mode: str) -> Any:
+        values = {
+            "graph_merge": self._rvg.PyDynamicRVGMode.GraphMerge,
+            "delta_graph_merge": (
+                self._rvg.PyDynamicRVGMode.ExactObservationDelta
+            ),
+            "buffered_delta_graph_merge": (
+                self._rvg.PyDynamicRVGMode.BufferedObservationDelta
+            ),
+            "incremental": self._rvg.PyDynamicRVGMode.IncrementalMapping,
+        }
+        if mode not in values:
+            raise ValueError(f"unsupported DynamicRVG planner mode: {mode}")
+        return values[mode]
+
+    def _scan_mode_value(self, mode: str) -> Any:
+        values = {
+            "center": self._rvg.ScanMode.Center,
+            "footprint": self._rvg.ScanMode.FootprintVertices,
+        }
+        if mode not in values:
+            raise ValueError(f"unsupported DynamicRVG scan mode: {mode}")
+        return values[mode]
 
     @staticmethod
     def default_robot_geometry(workspace: WorkspaceConfig) -> list[Point]:
@@ -136,10 +210,10 @@ class DynamicRVGSession:
         self._planner.updateRobotPose(self._vertex(measured_pose))
 
     def scan(self) -> Any:
-        return self._planner.scan(self._rvg.ScanMode.FootprintVertices)
+        return self._planner.scan(self._scan_mode)
 
     def step(self) -> DynamicRVGPlan:
-        result = self._planner.step(self._rvg.ScanMode.FootprintVertices)
+        result = self._planner.step(self._scan_mode)
         configurations = list(result.path)
         temporary_goal = None
         if result.temporaryGoal is not None:

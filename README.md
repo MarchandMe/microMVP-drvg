@@ -388,6 +388,19 @@ Add `--gui` for a live MicroMVP canvas:
 python examples/dynamic_rvg_simulation.py --gui
 ```
 
+The simulation exposes the same planner controls as
+`mainDebugDynamicRVG`, for example:
+
+```bash
+python examples/dynamic_rvg_simulation.py \
+  --mode buffered_delta_graph_merge \
+  --strategy quadtree_frontier_astar_information \
+  --scan-mode center --resolution 36 --num-threads 1
+```
+
+Use `--help` for the weight, iteration-limit, quadtree, and information-gain
+options.
+
 The GUI shows the simulated scan boundary, obstacle geometry, current and
 previous DRVG segments, controller target, measured trajectory, temporary
 goal, and final goal heading. Click the canvas to plan to a new goal from the
@@ -420,6 +433,11 @@ Run it from the MicroMVP checkout with the DRVG extension installed or on
 PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation.py \
   --config config/car_v4.yaml
 ```
+
+The real-hardware command accepts the same `--mode`, `--strategy`,
+`--scan-mode`, resolution, weight, iteration-limit, quadtree, and
+information-gain options as the simulation command. Its default
+`graph_merge` mode retains the accumulated graph across measured-pose steps.
 
 The robot remains stopped until you click a goal on the GUI canvas. Enter a
 goal heading before clicking if needed. `Space` or `C` immediately stops the

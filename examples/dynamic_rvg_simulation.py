@@ -18,7 +18,14 @@ from matplotlib.patches import Polygon as PolygonPatch
 from micromvp.controller import NavigationController
 from micromvp.core.models import Action, CarState, Pose
 from micromvp.env import SimConfig, SimEnv
-from micromvp.planner import DynamicRVGPlan, DynamicRVGSession, DynamicRVGSettings
+from micromvp.planner import (
+    PLANNER_MODES,
+    SCAN_MODES,
+    TEMPORARY_GOAL_STRATEGIES,
+    DynamicRVGPlan,
+    DynamicRVGSession,
+    DynamicRVGSettings,
+)
 
 
 ROBOT_ID = 1
@@ -37,6 +44,72 @@ def parse_args() -> argparse.Namespace:
         "--gui",
         action="store_true",
         help="Show the live MicroMVP GUI instead of running headlessly",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=TEMPORARY_GOAL_STRATEGIES,
+        default="quadtree",
+        help="Temporary-goal strategy (default: quadtree)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=PLANNER_MODES,
+        default="graph_merge",
+        help="DynamicRVG graph update mode (default: graph_merge)",
+    )
+    parser.add_argument(
+        "--scan-mode",
+        choices=SCAN_MODES,
+        default="center",
+        help="Software scan origin mode (default: center)",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=36,
+        help="DynamicRVG angular resolution (default: 36)",
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=1,
+        help="DynamicRVG worker threads (default: 1)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=10000,
+        help="Maximum DynamicRVG planning steps (default: 10000)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Euclidean path weight (default: 1)",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.1,
+        help="Rotational path weight (default: 0.1)",
+    )
+    parser.add_argument(
+        "--leaf-scale",
+        type=float,
+        default=1.0,
+        help="Quadtree minimum leaf width scale (default: 1)",
+    )
+    parser.add_argument(
+        "--bucket-capacity",
+        type=int,
+        default=32,
+        help="Quadtree bucket capacity (default: 32)",
+    )
+    parser.add_argument(
+        "--information-weight",
+        type=float,
+        default=1.0,
+        help="Information-gain score weight (default: 1)",
     )
     parser.add_argument(
         "--output-dir",
@@ -110,12 +183,17 @@ class DynamicRVGSimulation:
             self.workspace,
             OBSTACLES,
             DynamicRVGSettings(
-                resolution=36,
-                num_threads=1,
-                euclidean_weight=1.0,
-                rotational_weight=0.1,
-                minimum_leaf_width_scale=1.0,
-                bucket_capacity=32,
+                resolution=max(1, args.resolution),
+                num_threads=max(1, args.num_threads),
+                strategy=args.strategy,
+                planner_mode=args.mode,
+                scan_mode=args.scan_mode,
+                max_iterations=max(1, args.max_iterations),
+                euclidean_weight=max(0.0, args.alpha),
+                rotational_weight=max(0.0, args.beta),
+                minimum_leaf_width_scale=max(1e-9, args.leaf_scale),
+                bucket_capacity=max(1, args.bucket_capacity),
+                information_weight=max(0.0, args.information_weight),
                 robot_geometry_scale=1.2,
             ),
         )

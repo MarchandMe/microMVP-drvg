@@ -31,7 +31,14 @@ from micromvp.core.models import (
     RobotObservation,
     WorkspaceConfig,
 )
-from micromvp.planner import DynamicRVGPlan, DynamicRVGSession, DynamicRVGSettings
+from micromvp.planner import (
+    PLANNER_MODES,
+    SCAN_MODES,
+    TEMPORARY_GOAL_STRATEGIES,
+    DynamicRVGPlan,
+    DynamicRVGSession,
+    DynamicRVGSettings,
+)
 
 
 _NUMBER_PATTERN = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
@@ -66,13 +73,57 @@ def parse_args() -> argparse.Namespace:
         help="Initial heading for canvas goals, in degrees (default: 0)",
     )
     parser.add_argument(
+        "--strategy",
+        choices=TEMPORARY_GOAL_STRATEGIES,
+        default="quadtree",
+        help="Temporary-goal strategy (default: quadtree)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=PLANNER_MODES,
+        default="graph_merge",
+        help="DynamicRVG graph update mode (default: graph_merge)",
+    )
+    parser.add_argument(
+        "--scan-mode",
+        choices=SCAN_MODES,
+        default="center",
+        help="Software scan origin mode (default: center)",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        help="Override planner.rvg.resolution from the config",
+    )
+    parser.add_argument(
         "--num-threads",
         type=int,
         default=1,
         help="DynamicRVG worker threads (default: 1)",
     )
     parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=10000,
+        help="Maximum DynamicRVG planning steps (default: 10000)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Override planner.rvg.euclidean_weight from the config",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="Override planner.rvg.rotational_weight from the config",
+    )
+    parser.add_argument(
+        "--leaf-scale",
         "--minimum-leaf-width-scale",
+        dest="leaf_scale",
         type=float,
         default=1.0,
         help="DynamicRVG quadtree minimum leaf scale (default: 1)",
@@ -82,6 +133,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="DynamicRVG quadtree bucket capacity (default: 32)",
+    )
+    parser.add_argument(
+        "--information-weight",
+        type=float,
+        default=1.0,
+        help="Information-gain score weight (default: 1)",
     )
     parser.add_argument(
         "--output-dir",
@@ -708,23 +765,40 @@ def main() -> None:
     max_speed = cfg.require(
         "control.max_speed", float, who="DynamicRVG real navigation"
     )
+    configured_resolution = cfg.require(
+        "planner.rvg.resolution", int, who="DynamicRVG real navigation"
+    )
+    configured_alpha = cfg.require(
+        "planner.rvg.euclidean_weight",
+        float,
+        who="DynamicRVG real navigation",
+    )
+    configured_beta = cfg.require(
+        "planner.rvg.rotational_weight",
+        float,
+        who="DynamicRVG real navigation",
+    )
     settings = DynamicRVGSettings(
-        resolution=cfg.require(
-            "planner.rvg.resolution", int, who="DynamicRVG real navigation"
+        resolution=max(
+            1,
+            configured_resolution
+            if args.resolution is None
+            else args.resolution,
         ),
         num_threads=max(1, args.num_threads),
-        euclidean_weight=cfg.require(
-            "planner.rvg.euclidean_weight",
-            float,
-            who="DynamicRVG real navigation",
+        strategy=args.strategy,
+        planner_mode=args.mode,
+        scan_mode=args.scan_mode,
+        max_iterations=max(1, args.max_iterations),
+        euclidean_weight=max(
+            0.0, configured_alpha if args.alpha is None else args.alpha
         ),
-        rotational_weight=cfg.require(
-            "planner.rvg.rotational_weight",
-            float,
-            who="DynamicRVG real navigation",
+        rotational_weight=max(
+            0.0, configured_beta if args.beta is None else args.beta
         ),
-        minimum_leaf_width_scale=args.minimum_leaf_width_scale,
+        minimum_leaf_width_scale=max(1e-9, args.leaf_scale),
         bucket_capacity=max(1, args.bucket_capacity),
+        information_weight=max(0.0, args.information_weight),
         robot_geometry_scale=cfg.require(
             "navigation.robot_geometry_scale",
             float,
