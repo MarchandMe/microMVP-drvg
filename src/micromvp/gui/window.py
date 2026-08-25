@@ -149,7 +149,7 @@ class MVPWindow(QMainWindow):
         splitter.addWidget(separator)
 
         # Right: Canvas
-        self._canvas = MVPCanvas(self._ws_config)
+        self._canvas = self._create_canvas()
         splitter.addWidget(self._canvas)
 
         # Configure splitter stretch factors
@@ -171,6 +171,10 @@ class MVPWindow(QMainWindow):
             self._canvas.enable_curve_drawing(True)
         if canvas_config.get("click_canvas_callback", False):
             self._canvas.enable_canvas_click(True)
+
+    def _create_canvas(self) -> MVPCanvas:
+        """Construct the canvas; specialized windows can override this hook."""
+        return MVPCanvas(self._ws_config)
 
     def _connect_signals(self) -> None:
         """Connect canvas signals to internal handlers."""

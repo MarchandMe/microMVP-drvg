@@ -130,6 +130,7 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
         tmp_path,
         draw_planner_graphs=False,
         obstacle_padding_cm=0.5,
+        obstacle_draw_height_cm=4.0,
     )
     observation = RobotObservation(
         robot_id=3,
@@ -166,6 +167,13 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
     )
     assert scanned_area["type"] == "region"
     assert len(scanned_area["regions"]) == 1
+    obstacle_drawing = next(
+        drawing
+        for drawing in navigator._gui_drawings()
+        if drawing["uuid"] == "fixed_obstacle_0"
+    )
+    assert obstacle_drawing["projection_height_cm"] == 4.0
+    assert "projection_height_cm" not in scanned_area
 
     next_observation = RobotObservation(
         robot_id=3,

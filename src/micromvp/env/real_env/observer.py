@@ -411,8 +411,62 @@ class ArucoObserver:
                 pass
             self._window_inited = False
 
-    def set_frame_callback(self, callback: Callable[[np.ndarray], None]) -> None:
+    def set_frame_callback(
+        self, callback: Optional[Callable[[np.ndarray], None]]
+    ) -> None:
+        """Receive each raw BGR camera frame, or pass ``None`` to detach."""
         self._frame_callback = callback
+
+    def workspace_to_image_pixel(
+        self, x_cm: float, y_cm: float, height_cm: float = 0.0
+    ) -> Optional[Point]:
+        """Project a workspace point into the raw camera image.
+
+        ``height_cm`` lifts the rendered point above the floor without
+        changing its workspace XY coordinates. Planning geometry remains on
+        the floor; this is used only to align elevated objects visually.
+        """
+        workspace = self.get_workspace_estimate()
+        if not workspace.ready or self._K is None:
+            return None
+
+        point_cam = self._workspace_xy_to_camera(x_cm, y_cm, workspace)
+        if point_cam is None:
+            return None
+        normal = np.array(workspace.normal_cam, dtype=np.float64)
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length > 1e-9 and height_cm != 0.0:
+            point_cam = (
+                point_cam.astype(np.float64)
+                - (normal / normal_length) * (float(height_cm) / 100.0)
+            )
+        projected, _ = cv2.projectPoints(
+            point_cam.reshape(1, 1, 3),
+            np.zeros(3),
+            np.zeros(3),
+            self._K,
+            self._D if self._D is not None else np.zeros(5),
+        )
+        px, py = projected.reshape(2)
+        return float(px), float(py)
+
+    def image_pixel_to_workspace(
+        self, px: float, py: float
+    ) -> Optional[Point]:
+        """Cast a raw-image pixel onto the workspace ground plane."""
+        workspace = self.get_workspace_estimate()
+        if not workspace.ready or self._K is None:
+            return None
+
+        pixel = np.array([px, py], dtype=np.float64)
+        if self._D is not None:
+            pixel = cv2.undistortPoints(
+                pixel.reshape(1, 1, 2), self._K, self._D, P=self._K
+            ).reshape(2)
+        point_cam = self._project_pixel_to_floor(pixel, workspace)
+        if point_cam is None:
+            return None
+        return self._camera_to_workspace_xy(point_cam, workspace)
 
     def is_workspace_ready(self) -> bool:
         return self._ws_lock_state.is_locked

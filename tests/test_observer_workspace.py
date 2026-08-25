@@ -222,3 +222,34 @@ class TestMarkerOffsetTransform:
 
         np.testing.assert_allclose(out_x, np.array([0.0, -1.0]), atol=1e-6)
         np.testing.assert_allclose(out_y, np.array([1.0, 0.0]), atol=1e-6)
+
+
+class TestCameraWorkspaceProjection:
+    def test_raw_image_projection_round_trip(self):
+        observer = ArucoObserver(_default_config())
+        observer._K = np.array(
+            [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        observer._D = np.zeros(5, dtype=np.float64)
+        observer._workspace = _make_ws(
+            width=80.0,
+            height=50.0,
+            origin=(0.0, 0.0, 1.0),
+        )
+
+        pixel = observer.workspace_to_image_pixel(20.0, 10.0)
+        assert pixel is not None
+        np.testing.assert_allclose(pixel, (420.0, 290.0), atol=1e-6)
+
+        workspace = observer.image_pixel_to_workspace(*pixel)
+        assert workspace is not None
+        np.testing.assert_allclose(workspace, (20.0, 10.0), atol=1e-5)
+
+        elevated_pixel = observer.workspace_to_image_pixel(
+            20.0, 10.0, height_cm=10.0
+        )
+        assert elevated_pixel is not None
+        np.testing.assert_allclose(
+            elevated_pixel, (431.111111, 295.555556), atol=1e-4
+        )

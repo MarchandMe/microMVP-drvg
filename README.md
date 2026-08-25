@@ -434,6 +434,15 @@ PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigatio
   --config config/car_v4.yaml
 ```
 
+To use one perspective-aligned GUI with scan coverage and planner drawings
+over the live camera image, run the alternate overlay entry point with the
+same arguments:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation_overlay.py \
+  --config config/car_v4.yaml
+```
+
 The real-hardware command accepts the same `--mode`, `--strategy`,
 `--scan-mode`, resolution, weight, iteration-limit, quadtree, and
 information-gain options as the simulation command. Its default

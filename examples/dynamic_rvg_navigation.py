@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from micromvp.controller import NavigationController
 from micromvp.core.models import (
@@ -204,6 +204,7 @@ class DynamicRVGRealNavigator:
         draw_planner_graphs: bool = True,
         goal_heading: float = 0.0,
         obstacle_padding_cm: float = 0.0,
+        obstacle_draw_height_cm: float = 0.0,
     ) -> None:
         self.workspace = workspace
         self.controller = controller
@@ -211,6 +212,9 @@ class DynamicRVGRealNavigator:
         self.output_dir = output_dir
         self.draw_planner_graphs = draw_planner_graphs
         self.obstacle_padding_cm = max(0.0, float(obstacle_padding_cm))
+        self.obstacle_draw_height_cm = max(
+            0.0, float(obstacle_draw_height_cm)
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
@@ -684,14 +688,14 @@ class DynamicRVGRealNavigator:
             )
 
         for index, obstacle in enumerate(self._fixed_obstacles):
-            drawings.append(
-                self._path_drawing(
-                    f"fixed_obstacle_{index}",
-                    self._closed(obstacle),
-                    "#FF6600",
-                    3,
-                )
+            drawing = self._path_drawing(
+                f"fixed_obstacle_{index}",
+                self._closed(obstacle),
+                "#FF6600",
+                3,
             )
+            drawing["projection_height_cm"] = self.obstacle_draw_height_cm
+            drawings.append(drawing)
 
         for index, segment in enumerate(self.planned_segments):
             if len(segment) < 2:
@@ -828,7 +832,12 @@ class DynamicRVGRealNavigator:
         return str(status).split(".")[-1]
 
 
-def main() -> None:
+def main(
+    *,
+    window_factory: Callable[[dict[str, Any], WorkspaceConfig, Any], Any]
+    | None = None,
+    render_environment: bool = True,
+) -> None:
     args = parse_args()
 
     # Keep hardware-only imports after argument parsing so --help works on a
@@ -907,6 +916,11 @@ def main() -> None:
     )
     if obstacle_padding_cm < 0.0:
         raise ValueError("navigation.obstacle_padding_cm must be non-negative")
+    obstacle_draw_height_cm = cfg.require(
+        "obstacle.marker_height_cm",
+        float,
+        who="DynamicRVG real navigation",
+    )
     settings = DynamicRVGSettings(
         resolution=max(
             1,
@@ -956,6 +970,7 @@ def main() -> None:
             draw_planner_graphs=not args.no_planner_drawings,
             goal_heading=args.goal_heading,
             obstacle_padding_cm=obstacle_padding_cm,
+            obstacle_draw_height_cm=obstacle_draw_height_cm,
         )
     except Exception:
         print("[main] Planner startup failed; stopping hardware")
@@ -1034,7 +1049,11 @@ def main() -> None:
             {"type": "label", "text": "Green: plan   Blue: measured path"},
         ],
     }
-    gui = MVPWindow(gui_config, workspace)
+    gui = (
+        MVPWindow(gui_config, workspace)
+        if window_factory is None
+        else window_factory(gui_config, workspace, environment)
+    )
     running = threading.Event()
     running.set()
     recapture_requested = threading.Event()
@@ -1152,7 +1171,8 @@ def main() -> None:
     def main_thread_update() -> None:
         if not running.is_set():
             return
-        environment.render()
+        if render_environment:
+            environment.render()
         with observations_lock:
             observations_available = bool(latest_observations)
         car_states, drawings = navigator.snapshot()

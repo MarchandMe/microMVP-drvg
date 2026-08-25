@@ -6,7 +6,7 @@ RealEnv – real hardware environment using:
 from __future__ import annotations
 
 import time
-from typing import Dict
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from micromvp.config import Config
 from micromvp.core.models import Action, RobotObservation, WorkspaceConfig
@@ -150,6 +150,22 @@ class RealEnv(Environment):
 
     def reset_obstacles(self) -> None:
         self._observer.reset_obstacles()
+
+    def set_frame_callback(
+        self, callback: Optional[Callable[[Any], None]]
+    ) -> None:
+        """Attach a consumer for raw BGR camera frames."""
+        self._observer.set_frame_callback(callback)
+
+    def workspace_to_image_pixel(
+        self, x_cm: float, y_cm: float, height_cm: float = 0.0
+    ) -> Optional[Tuple[float, float]]:
+        return self._observer.workspace_to_image_pixel(x_cm, y_cm, height_cm)
+
+    def image_pixel_to_workspace(
+        self, px: float, py: float
+    ) -> Optional[Tuple[float, float]]:
+        return self._observer.image_pixel_to_workspace(px, py)
 
     def render(self) -> None:
         self._observer.render()
