@@ -25,6 +25,7 @@ from micromvp.planner import (
     DynamicRVGPlan,
     DynamicRVGSession,
     DynamicRVGSettings,
+    pad_obstacles,
 )
 
 
@@ -112,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         help="Information-gain score weight (default: 1)",
     )
     parser.add_argument(
+        "--obstacle-padding",
+        type=float,
+        default=0.5,
+        help="Outward obstacle padding in cm (default: 0.5)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("simulation_output/dynamic_rvg"),
@@ -170,6 +177,10 @@ class DynamicRVGSimulation:
         self.args.output_dir.mkdir(parents=True, exist_ok=True)
         self.environment = create_environment(args.speed_scale)
         self.workspace = self.environment.workspace_config
+        self.obstacles = pad_obstacles(
+            OBSTACLES,
+            max(0.0, args.obstacle_padding),
+        )
         self.controller = NavigationController(
             ROBOT_ID,
             self.workspace,
@@ -181,7 +192,7 @@ class DynamicRVGSimulation:
         )
         self.planner = DynamicRVGSession(
             self.workspace,
-            OBSTACLES,
+            self.obstacles,
             DynamicRVGSettings(
                 resolution=max(1, args.resolution),
                 num_threads=max(1, args.num_threads),
@@ -202,6 +213,12 @@ class DynamicRVGSimulation:
         self.start_pose = START
         self.trajectory: list[tuple[float, float]] = []
         self.planned_segments: list[list[tuple[float, float]]] = []
+        self._scanned_regions: list[
+            tuple[
+                list[tuple[float, float]],
+                list[list[tuple[float, float]]],
+            ]
+        ] = []
         self.current_plan: DynamicRVGPlan | None = None
         self.planning_step = 0
         self.needs_plan = True
@@ -230,6 +247,7 @@ class DynamicRVGSimulation:
         self.planner.initialize(observation.pose, goal)
         self.trajectory = [(observation.x, observation.y)]
         self.planned_segments = []
+        self._scanned_regions = []
         self.current_plan = None
         self.planning_step = 0
         self.needs_plan = True
@@ -315,6 +333,7 @@ class DynamicRVGSimulation:
 
     def _plan_next_segment(self) -> None:
         plan = self.planner.step()
+        self._record_latest_scan_region()
         self.current_plan = plan
         self.planning_step += 1
         status_name = self._status_name(plan.status)
@@ -340,6 +359,17 @@ class DynamicRVGSimulation:
         self.needs_plan = False
         self.status_message = (
             f"{status_name}: executing segment {self.planning_step}"
+        )
+
+    def _record_latest_scan_region(self) -> None:
+        outer_boundary, holes = self.planner.latest_visible_region()
+        if not outer_boundary:
+            return
+        self._scanned_regions.append(
+            (
+                list(outer_boundary),
+                [list(hole) for hole in holes],
+            )
         )
 
     def goal_errors(self, pose: Pose) -> tuple[float, float]:
@@ -376,27 +406,23 @@ class DynamicRVGSimulation:
     def _gui_drawings(self) -> list[dict[str, Any]]:
         drawings: list[dict[str, Any]] = []
 
-        outer_boundary, holes = self.planner.latest_visible_region()
-        if outer_boundary:
+        if self._scanned_regions:
             drawings.append(
-                self._path_drawing(
-                    "visible_region",
-                    self._closed(outer_boundary),
-                    "#D6A20B",
-                    1,
-                )
-            )
-        for index, hole in enumerate(holes):
-            drawings.append(
-                self._path_drawing(
-                    f"visible_hole_{index}",
-                    self._closed(hole),
-                    "#00AAAA",
-                    1,
-                )
+                {
+                    "uuid": "scanned_area",
+                    "type": "region",
+                    "regions": [
+                        {"outer": outer, "holes": holes}
+                        for outer, holes in self._scanned_regions
+                    ],
+                    "color": "#D6A20B",
+                    "fill": "#40D6A20B",
+                    "width": 1,
+                    "z": -10,
+                }
             )
 
-        for index, obstacle in enumerate(OBSTACLES):
+        for index, obstacle in enumerate(self.obstacles):
             drawings.append(
                 self._path_drawing(
                     f"obstacle_{index}",
@@ -540,7 +566,7 @@ class DynamicRVGSimulation:
                 self.planned_segments,
                 self.start_pose,
                 self.goal,
-                OBSTACLES,
+                self.obstacles,
             )
             return output_path
 
@@ -673,7 +699,13 @@ def run_gui(args: argparse.Namespace) -> None:
             },
             {"type": "label", "text": "Click the canvas to set a new goal"},
             {"type": "label", "text": "R: restart   Space: pause   Esc: quit"},
-            {"type": "label", "text": "Orange: obstacle   Gold: visible area"},
+            {
+                "type": "label",
+                "text": (
+                    f"Orange: obstacle + {max(0.0, args.obstacle_padding):.1f} cm"
+                    "   Gold: scanned area"
+                ),
+            },
             {"type": "label", "text": "Green: plan   Blue: measured trajectory"},
         ],
     }

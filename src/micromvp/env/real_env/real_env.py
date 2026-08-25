@@ -148,6 +148,9 @@ class RealEnv(Environment):
     def get_obstacles(self) -> list:
         return self._observer.get_obstacles()
 
+    def reset_obstacles(self) -> None:
+        self._observer.reset_obstacles()
+
     def render(self) -> None:
         self._observer.render()
 

@@ -447,6 +447,12 @@ class ArucoObserver:
         with self._obstacle_lock:
             return [list(poly) for poly in self._obstacle_polygons]
 
+    def reset_obstacles(self) -> None:
+        """Clear cached geometry and force detection on the next camera frame."""
+        with self._obstacle_lock:
+            self._obstacle_polygons = []
+            self._last_obstacle_time = 0.0
+
     def get_detected_car_ids(self) -> List[int]:
         with self._car_ids_lock:
             return sorted(self._known_car_ids)

@@ -68,15 +68,31 @@ obstacle:
       description: "4 x 16 cm bar"
       polygon: [[-6.0, -2.0], [10.0, -2.0], [10.0, 2.0], [-6.0, 2.0]]
     1:
-      description: "11 x 11 cm cross"
+      description: "4-block staircase (12 x 8 cm)"
       polygon: [[-2.0, -2.0], [6.0, -2.0], [6.0, 2.0], [2.0, 2.0],
                 [2.0, 6.0], [-6.0, 6.0], [-6.0, 2.0], [-2.0, 2.0]]
+    2:
+      description: "4-block upward-facing T (12 x 8 cm)"
+      polygon: [[-6.0, -2.0], [6.0, -2.0], [6.0, 2.0], [2.0, 2.0],
+                [2.0, 6.0], [-2.0, 6.0], [-2.0, 2.0], [-6.0, 2.0]]
+    3:
+      description: "4-block right-facing T (8 x 12 cm)"
+      polygon: [[-2.0, -6.0], [2.0, -6.0], [2.0, -2.0], [6.0, -2.0],
+                [6.0, 2.0], [2.0, 2.0], [2.0, 6.0], [-2.0, 6.0]]
+    6:
+      description: "4-block staircase (12 x 8 cm)"
+      polygon: [[-6.0, -6.0], [2.0, -6.0], [2.0, -2.0], [6.0, -2.0],
+                [6.0, 2.0], [-2.0, 2.0], [-2.0, -2.0], [-6.0, -2.0]]
+    13:
+      description: "4-block staircase (12 x 8 cm)"
+      polygon: [[-6.0, -2.0], [2.0, -2.0], [2.0, 2.0], [6.0, 2.0],
+                [6.0, 6.0], [-2.0, 6.0], [-2.0, 2.0], [-6.0, 2.0]]
 
 # -----------------------------------------------------------------------------
 # Camera
 # -----------------------------------------------------------------------------
 camera:
-  device: 0
+  device: 12
   resolution: 720p          # 480p | 720p | 1080p
   fps: 60
 
@@ -178,14 +194,14 @@ runtime:
 # -----------------------------------------------------------------------------
 control:
   # Wheel thrust ceiling, 0..1.
-  max_speed: 0.3
+  max_speed: 0.25
 
   # Pure-pursuit lookahead. null derives it from the car size, which is
   # usually what you want; set a number in cm to override.
-  lookahead_cm: null
+  lookahead_cm: 1.2
 
   # Distance at which a waypoint counts as reached. null derives from car size.
-  goal_tolerance_cm: null
+  goal_tolerance_cm: 0.5
 
   # Path resampling: neighbouring points are split until no gap exceeds
   # this fraction of the car size.
@@ -198,8 +214,8 @@ control:
   rotation:
     # In-place rotation finishes once the heading error stays inside this
     # band for stable_time_sec.
-    tolerance_deg: 2.5
-    stable_time_sec: 0.5
+    tolerance_deg: 4.0
+    stable_time_sec: 0.2
 
     # Rotation thrust range. Below 15 degrees of error the controller holds
     # speed_min until it reaches tolerance_deg, so speed_min sets how far it
@@ -223,7 +239,11 @@ navigation:
 
   # The planner treats the robot as this much larger than it is, so planned
   # paths keep clear of obstacles. 1.0 plans against the true footprint.
-  robot_geometry_scale: 1.2
+  robot_geometry_scale: 1.3
+
+  # Expand every detected obstacle polygon outward by this distance before
+  # planning. This is independent of robot_geometry_scale.
+  obstacle_padding_cm: 0.0
 
 # -----------------------------------------------------------------------------
 # Path planning

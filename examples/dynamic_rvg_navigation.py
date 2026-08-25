@@ -38,6 +38,7 @@ from micromvp.planner import (
     DynamicRVGPlan,
     DynamicRVGSession,
     DynamicRVGSettings,
+    pad_obstacles,
 )
 
 
@@ -170,8 +171,11 @@ def capture_fixed_obstacles(
     duration: float,
     frequency: float,
 ) -> list[list[Point]]:
-    """Capture the latest non-empty real-world obstacle observation."""
+    """Clear cached geometry and capture a fresh obstacle observation."""
     environment.stop_all()
+    reset_obstacles = getattr(environment, "reset_obstacles", None)
+    if callable(reset_obstacles):
+        reset_obstacles()
     deadline = time.monotonic() + max(0.0, duration)
     snapshot = copy_obstacles(environment.get_obstacles())
     sample_period = 1.0 / max(1.0, frequency)
@@ -180,8 +184,7 @@ def capture_fixed_obstacles(
         environment.stop_all()
         environment.observe()
         candidate = copy_obstacles(environment.get_obstacles())
-        if candidate:
-            snapshot = candidate
+        snapshot = candidate
         time.sleep(sample_period)
 
     environment.stop_all()
@@ -200,18 +203,24 @@ class DynamicRVGRealNavigator:
         output_dir: Path,
         draw_planner_graphs: bool = True,
         goal_heading: float = 0.0,
+        obstacle_padding_cm: float = 0.0,
     ) -> None:
         self.workspace = workspace
         self.controller = controller
         self.settings = settings
         self.output_dir = output_dir
         self.draw_planner_graphs = draw_planner_graphs
+        self.obstacle_padding_cm = max(0.0, float(obstacle_padding_cm))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
-        self._fixed_obstacles = copy_obstacles(obstacles)
+        self._fixed_obstacles = pad_obstacles(
+            copy_obstacles(obstacles),
+            self.obstacle_padding_cm,
+        )
         self.planner = self._new_planner()
         self._pending_goal: Pose | None = None
+        self._goal_waiting_for_obstacle_scan = False
         self._goal_heading = goal_heading % 360.0
         self._last_observation: RobotObservation | None = None
         self._status_before_tracking_loss = "Idle; click the canvas to set a goal"
@@ -220,7 +229,11 @@ class DynamicRVGRealNavigator:
         self.start_pose: Pose | None = None
         self.trajectory: list[Point] = []
         self.planned_segments: list[list[Point]] = []
+        self._scanned_regions: list[
+            tuple[list[Point], list[list[Point]]]
+        ] = []
         self.current_plan: DynamicRVGPlan | None = None
+        self._replan_pose_override: Pose | None = None
         self.run_number = 0
         self.planning_step = 0
         self.needs_plan = False
@@ -245,7 +258,7 @@ class DynamicRVGRealNavigator:
         )
 
     def request_goal(self, x: float, y: float) -> bool:
-        """Queue a canvas goal; initialization uses the next measured pose."""
+        """Queue a goal that remains stopped until a fresh obstacle scan."""
         with self._lock:
             if not (0.0 <= x <= self.workspace.width):
                 self.status_message = f"Rejected goal: x={x:.2f} is outside workspace"
@@ -254,8 +267,19 @@ class DynamicRVGRealNavigator:
                 self.status_message = f"Rejected goal: y={y:.2f} is outside workspace"
                 return False
             self._pending_goal = (float(x), float(y), self._goal_heading)
+            self._goal_waiting_for_obstacle_scan = True
+            self.controller.reset()
+            self.needs_plan = False
+            self._replan_pose_override = None
+            self.segment_rotation_active = False
+            self.final_segment_active = False
+            self.active = False
+            self.finished = False
+            self.failed = False
+            self._scanned_regions = []
             self.status_message = (
-                f"Goal queued: ({x:.2f}, {y:.2f}, {self._goal_heading:.1f} deg)"
+                f"Goal queued: ({x:.2f}, {y:.2f}, "
+                f"{self._goal_heading:.1f} deg); rescanning obstacles"
             )
             return True
 
@@ -280,7 +304,9 @@ class DynamicRVGRealNavigator:
         with self._lock:
             self.controller.reset()
             self._pending_goal = None
+            self._goal_waiting_for_obstacle_scan = False
             self.needs_plan = False
+            self._replan_pose_override = None
             self.segment_rotation_active = False
             self.final_segment_active = False
             self.active = False
@@ -295,14 +321,26 @@ class DynamicRVGRealNavigator:
         """Replace the fixed world while stopped, discarding planner history."""
         with self._lock:
             self.controller.reset()
-            self._fixed_obstacles = copy_obstacles(obstacles)
-            self.planner = self._new_planner()
+            previous_obstacles = self._fixed_obstacles
+            next_obstacles = pad_obstacles(
+                copy_obstacles(obstacles),
+                self.obstacle_padding_cm,
+            )
+            self._fixed_obstacles = next_obstacles
+            try:
+                next_planner = self._new_planner()
+            except Exception:
+                self._fixed_obstacles = previous_obstacles
+                raise
+            self.planner = next_planner
             self.goal = None
             self.start_pose = None
             self.trajectory = []
             self.planned_segments = []
+            self._scanned_regions = []
             self.current_plan = None
-            self._pending_goal = None
+            self._replan_pose_override = None
+            self._goal_waiting_for_obstacle_scan = False
             self.planning_step = 0
             self.needs_plan = False
             self.segment_rotation_active = False
@@ -310,10 +348,25 @@ class DynamicRVGRealNavigator:
             self.active = False
             self.finished = False
             self.failed = False
-            self.status_message = (
-                f"Captured {len(self._fixed_obstacles)} fixed obstacle(s); "
-                "click the canvas to set a goal"
-            )
+            if self._pending_goal is None:
+                self.status_message = (
+                    f"Captured {len(self._fixed_obstacles)} fixed obstacle(s); "
+                    "click the canvas to set a goal"
+                )
+            else:
+                self.status_message = (
+                    f"Captured {len(self._fixed_obstacles)} fixed obstacle(s); "
+                    "initializing queued goal"
+                )
+
+    def report_obstacle_capture_failed(self, error: Exception) -> None:
+        """Keep the previous safe world after a rejected rescan."""
+        with self._lock:
+            self.controller.reset()
+            self.needs_plan = False
+            self.active = False
+            self.failed = True
+            self.status_message = f"OBSTACLE SCAN REJECTED - robot stopped: {error}"
 
     def report_tracking_lost(self) -> None:
         with self._lock:
@@ -330,19 +383,44 @@ class DynamicRVGRealNavigator:
                 self.tracking_lost = False
                 self.status_message = self._status_before_tracking_loss
 
+            if (
+                self._pending_goal is not None
+                and self._goal_waiting_for_obstacle_scan
+            ):
+                self.controller.update(observation)
+                return Action.stop()
+
             if self._pending_goal is not None:
                 self._initialize_run(observation, self._pending_goal)
                 self._pending_goal = None
+                # DRVG's first graph must be built from the exact pose used
+                # for initialization.  A later camera frame differs even for
+                # a stationary robot, which leaves the original start vertex
+                # out of the first graph and is reported as CurrentPoseInvalid.
+                self._plan_next_segment(observation)
                 return Action.stop()
 
             if not self.active:
                 self.controller.update(observation)
                 return Action.stop()
 
-            self.planner.update_pose(observation)
+            planner_pose: Pose | RobotObservation = observation
+            if self.needs_plan and self._replan_pose_override is not None:
+                planner_pose = self._replan_pose_override
+                measured = observation.pose
+                print(
+                    "[DynamicRVG] Actual-size pose is valid; replanning from "
+                    "the planned terminal configuration "
+                    f"({planner_pose[0]:.3f}, {planner_pose[1]:.3f}, "
+                    f"{planner_pose[2]:.2f} deg) instead of measured "
+                    f"({measured[0]:.3f}, {measured[1]:.3f}, "
+                    f"{measured[2]:.2f} deg)"
+                )
+            self.planner.update_pose(planner_pose)
 
             if self.needs_plan:
                 self._plan_next_segment(observation)
+                self._replan_pose_override = None
                 if self.failed or self.finished:
                     self.controller.update(observation)
                     return Action.stop()
@@ -374,13 +452,16 @@ class DynamicRVGRealNavigator:
         self.controller.reset()
         self.controller.update(observation)
         self.planner.initialize(observation.pose, goal)
+        self._goal_waiting_for_obstacle_scan = False
         self.run_number += 1
         self.planning_step = 0
         self.start_pose = observation.pose
         self.goal = goal
         self.trajectory = [observation.position]
         self.planned_segments = []
+        self._scanned_regions = []
         self.current_plan = None
+        self._replan_pose_override = None
         self.needs_plan = True
         self.segment_rotation_active = False
         self.final_segment_active = False
@@ -391,6 +472,7 @@ class DynamicRVGRealNavigator:
 
     def _plan_next_segment(self, observation: RobotObservation) -> None:
         plan = self.planner.step()
+        self._record_latest_scan_region()
         self.current_plan = plan
         self.planning_step += 1
         status_name = self._status_name(plan.status)
@@ -425,7 +507,21 @@ class DynamicRVGRealNavigator:
             self.active = False
             self.failed = True
             self.needs_plan = False
-            self.status_message = f"PLANNER FAILED - robot stopped: {status_name}"
+            if (
+                status_name == "CurrentPoseInvalid"
+                and self.planner.pose_is_valid(
+                    observation.pose,
+                    robot_geometry_scale=1.0,
+                )
+            ):
+                self.status_message = (
+                    "PLANNER SAFETY MARGIN REJECTED CURRENT POSE - "
+                    "actual-size footprint is valid; robot stopped"
+                )
+            else:
+                self.status_message = (
+                    f"PLANNER FAILED - robot stopped: {status_name}"
+                )
             return
 
         self.planned_segments.append(list(plan.controller_path))
@@ -465,6 +561,18 @@ class DynamicRVGRealNavigator:
             self._finish_goal(pose)
             return
 
+        if self.current_plan is not None and self.current_plan.configurations:
+            terminal = self.current_plan.configurations[-1]
+            if self.planner.pose_is_valid(
+                pose,
+                robot_geometry_scale=1.0,
+            ):
+                self._replan_pose_override = (
+                    terminal.getX(),
+                    terminal.getY(),
+                    math.degrees(terminal.getTheta()) % 360.0,
+                )
+
         if self.planner.complete_current_segment():
             self.needs_plan = True
             self.status_message = (
@@ -487,10 +595,22 @@ class DynamicRVGRealNavigator:
         self.finished = True
         self.failed = False
         self.needs_plan = False
+        self._replan_pose_override = None
         self.segment_rotation_active = False
         self.status_message = (
             f"Goal reached: position error {distance:.3f} cm, "
             f"heading error {heading_error:.3f} deg"
+        )
+
+    def _record_latest_scan_region(self) -> None:
+        outer_boundary, holes = self.planner.latest_visible_region()
+        if not outer_boundary:
+            return
+        self._scanned_regions.append(
+            (
+                list(outer_boundary),
+                [list(hole) for hole in holes],
+            )
         )
 
     def goal_errors(self, pose: Pose) -> tuple[float, float]:
@@ -547,18 +667,20 @@ class DynamicRVGRealNavigator:
 
     def _gui_drawings(self) -> list[dict[str, Any]]:
         drawings: list[dict[str, Any]] = []
-        outer_boundary, holes = self.planner.latest_visible_region()
-        if outer_boundary:
+        if self._scanned_regions:
             drawings.append(
-                self._path_drawing(
-                    "visible_region", self._closed(outer_boundary), "#D6A20B", 1
-                )
-            )
-        for index, hole in enumerate(holes):
-            drawings.append(
-                self._path_drawing(
-                    f"visible_hole_{index}", self._closed(hole), "#00AAAA", 1
-                )
+                {
+                    "uuid": "scanned_area",
+                    "type": "region",
+                    "regions": [
+                        {"outer": outer, "holes": holes}
+                        for outer, holes in self._scanned_regions
+                    ],
+                    "color": "#D6A20B",
+                    "fill": "#40D6A20B",
+                    "width": 1,
+                    "z": -10,
+                }
             )
 
         for index, obstacle in enumerate(self._fixed_obstacles):
@@ -778,6 +900,13 @@ def main() -> None:
         float,
         who="DynamicRVG real navigation",
     )
+    obstacle_padding_cm = cfg.require(
+        "navigation.obstacle_padding_cm",
+        float,
+        who="DynamicRVG real navigation",
+    )
+    if obstacle_padding_cm < 0.0:
+        raise ValueError("navigation.obstacle_padding_cm must be non-negative")
     settings = DynamicRVGSettings(
         resolution=max(
             1,
@@ -817,15 +946,22 @@ def main() -> None:
     )
     print(f"[main] Captured {len(fixed_obstacles)} obstacle polygon(s)")
 
-    navigator = DynamicRVGRealNavigator(
-        workspace,
-        controller,
-        fixed_obstacles,
-        settings,
-        args.output_dir,
-        draw_planner_graphs=not args.no_planner_drawings,
-        goal_heading=args.goal_heading,
-    )
+    try:
+        navigator = DynamicRVGRealNavigator(
+            workspace,
+            controller,
+            fixed_obstacles,
+            settings,
+            args.output_dir,
+            draw_planner_graphs=not args.no_planner_drawings,
+            goal_heading=args.goal_heading,
+            obstacle_padding_cm=obstacle_padding_cm,
+        )
+    except Exception:
+        print("[main] Planner startup failed; stopping hardware")
+        environment.stop_all()
+        environment.close()
+        raise
 
     gui_config = {
         "canvas": {"click_canvas_callback": True},
@@ -884,11 +1020,17 @@ def main() -> None:
                 "label": "Recapture fixed obstacles",
                 "callback_name": "recapture_obstacles",
             },
-            {"type": "label", "text": "Click canvas: start a new run"},
+            {
+                "type": "label",
+                "text": "Click canvas: rescan obstacles, then start",
+            },
             {"type": "label", "text": "C or Space: stop/cancel"},
             {"type": "label", "text": "O: recapture obstacles   Esc: quit"},
-            {"type": "label", "text": "Orange: fixed obstacle"},
-            {"type": "label", "text": "Gold: simulated visible region"},
+            {
+                "type": "label",
+                "text": f"Orange: obstacle + {obstacle_padding_cm:.1f} cm padding",
+            },
+            {"type": "label", "text": "Gold: scanned area"},
             {"type": "label", "text": "Green: plan   Blue: measured path"},
         ],
     }
@@ -896,6 +1038,7 @@ def main() -> None:
     running = threading.Event()
     running.set()
     recapture_requested = threading.Event()
+    recapture_generation = 0
     hardware_action_lock = threading.Lock()
 
     def stop_and_cancel(reason: str) -> None:
@@ -905,15 +1048,20 @@ def main() -> None:
             environment.stop_all()
 
     def on_canvas_click(x: float, y: float) -> None:
+        nonlocal recapture_generation
         environment.stop_all()
         with hardware_action_lock:
-            navigator.request_goal(x, y)
+            if navigator.request_goal(x, y):
+                recapture_generation += 1
+                recapture_requested.set()
             environment.stop_all()
 
     def request_recapture() -> None:
+        nonlocal recapture_generation
         environment.stop_all()
         with hardware_action_lock:
             navigator.begin_obstacle_capture()
+            recapture_generation += 1
             recapture_requested.set()
             environment.stop_all()
 
@@ -948,14 +1096,26 @@ def main() -> None:
             started = time.monotonic()
 
             if recapture_requested.is_set():
-                recapture_requested.clear()
+                with hardware_action_lock:
+                    # A goal selected during a capture increments this value;
+                    # discard that partial capture and run a full new one.
+                    capture_generation = recapture_generation
+                    recapture_requested.clear()
                 new_obstacles = capture_fixed_obstacles(
                     environment,
                     args.obstacle_capture_seconds,
                     workspace.frequency,
                 )
                 with hardware_action_lock:
-                    navigator.replace_obstacles(new_obstacles)
+                    if capture_generation != recapture_generation:
+                        recapture_requested.set()
+                        environment.stop_all()
+                        continue
+                    try:
+                        navigator.replace_obstacles(new_obstacles)
+                    except (RuntimeError, ValueError) as error:
+                        navigator.report_obstacle_capture_failed(error)
+                        print(f"[DynamicRVG] Obstacle rescan rejected: {error}")
                     environment.stop_all()
 
             with hardware_action_lock:
@@ -1016,9 +1176,10 @@ def main() -> None:
     print(f"  Workspace       : {workspace.width:.1f} x {workspace.height:.1f} cm")
     print(f"  Active robot    : {active_robot_id}")
     print(f"  Fixed obstacles : {len(fixed_obstacles)}")
+    print(f"  Obstacle padding: {obstacle_padding_cm:.2f} cm")
     print(f"  Goal heading    : {args.goal_heading % 360.0:.1f} deg")
     print(f"  Planner graphs  : {args.output_dir}")
-    print("  Start a run     : click the GUI canvas")
+    print("  Start a run     : click canvas (performs a full obstacle rescan)")
     print("  Emergency stop  : Space or C")
     print("  Recapture world : O")
     print("=" * 64)

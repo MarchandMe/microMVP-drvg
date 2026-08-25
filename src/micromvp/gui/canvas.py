@@ -479,7 +479,7 @@ class MVPCanvas(QGraphicsView):
         if dtype == "line": return QGraphicsLineItem()
         if dtype == "circle" or dtype == "point": return QGraphicsEllipseItem()
         if dtype == "rect": return QGraphicsRectItem()
-        if dtype == "path": return QGraphicsPathItem()
+        if dtype == "path" or dtype == "region": return QGraphicsPathItem()
         return None
 
     def _update_drawing_geometry(self, item: QGraphicsItem, drawing: Dict[str, Any]):
@@ -495,6 +495,7 @@ class MVPCanvas(QGraphicsView):
         # but cosmetic is safer for performance on some Qt backends. 
         # Here we leave it default (False) so width=2 means 2 pixels.
         item.setPen(pen)
+        item.setZValue(float(drawing.get("z", 0.0)))
         
         if "fill" in drawing and hasattr(item, "setBrush"):
             item.setBrush(QBrush(QColor(drawing["fill"])))
@@ -544,6 +545,30 @@ class MVPCanvas(QGraphicsView):
                     px, py = self.workspace_to_pixel(pt[0], pt[1])
                     path.lineTo(px, py)
             item.setPath(path)
+
+        elif dtype == "region" and isinstance(item, QGraphicsPathItem):
+            combined_path = QPainterPath()
+            for region in drawing.get("regions", []):
+                region_path = QPainterPath()
+                region_path.setFillRule(Qt.FillRule.OddEvenFill)
+                for points in [region.get("outer", [])] + list(
+                    region.get("holes", [])
+                ):
+                    if len(points) < 3:
+                        continue
+                    px0, py0 = self.workspace_to_pixel(
+                        points[0][0], points[0][1]
+                    )
+                    region_path.moveTo(px0, py0)
+                    for x, y in points[1:]:
+                        px, py = self.workspace_to_pixel(x, y)
+                        region_path.lineTo(px, py)
+                    region_path.closeSubpath()
+                if combined_path.isEmpty():
+                    combined_path = region_path
+                else:
+                    combined_path = combined_path.united(region_path)
+            item.setPath(combined_path)
 
     # -------------------------------------------------------------------------
     # Interaction

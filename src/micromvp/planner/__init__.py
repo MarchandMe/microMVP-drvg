@@ -7,6 +7,8 @@ from .dynamic_rvg import (
     DynamicRVGPlan,
     DynamicRVGSession,
     DynamicRVGSettings,
+    pad_obstacle_polygon,
+    pad_obstacles,
 )
 
 __all__ = [
@@ -16,4 +18,6 @@ __all__ = [
     "PLANNER_MODES",
     "SCAN_MODES",
     "TEMPORARY_GOAL_STRATEGIES",
+    "pad_obstacle_polygon",
+    "pad_obstacles",
 ]

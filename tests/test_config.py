@@ -43,8 +43,8 @@ class TestLookup:
         assert cfg.optional("car.nonexistent", 7.0) == 7.0
 
     def test_null_stays_null(self, cfg):
-        # lookahead_cm is deliberately nullable: null means "derive it"
-        assert cfg.require("control.lookahead_cm") is None
+        # active_robot_id is deliberately nullable: null selects the first car.
+        assert cfg.require("navigation.active_robot_id") is None
 
 
 class TestMissingField:

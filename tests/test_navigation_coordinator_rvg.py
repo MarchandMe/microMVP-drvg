@@ -17,6 +17,7 @@ from micromvp.coordinator.navigation_coordinator.navigation_coordinator import (
     NavigationCoordinator,
 )
 from micromvp.core.models import CarState, WorkspaceConfig
+from micromvp.planner.dynamic_rvg import DynamicRVGSession, DynamicRVGSettings
 
 
 class _DummyController(Controller):
@@ -93,3 +94,76 @@ def test_default_robot_geometry_uses_conservative_front_extent(
     assert front_extent >= 2.1
     assert front_extent >= upper_half_width
     assert front_extent >= lower_half_width
+
+
+def test_dynamic_rvg_merges_intersecting_world_obstacles() -> None:
+    workspace = WorkspaceConfig(
+        width=20.0,
+        height=20.0,
+        car_width=1.0,
+        car_height=1.0,
+        offset_w=0.5,
+        offset_h=0.5,
+        wheel_base=1.0,
+        max_wheel_speed=1.0,
+        frequency=30.0,
+        car_id_list=[1],
+    )
+    overlapping_obstacles = [
+        [(5.0, 5.0), (9.0, 5.0), (9.0, 9.0), (5.0, 9.0)],
+        [(8.5, 5.0), (12.0, 5.0), (12.0, 9.0), (8.5, 9.0)],
+    ]
+
+    session = DynamicRVGSession(
+        workspace,
+        overlapping_obstacles,
+        DynamicRVGSettings(resolution=4),
+    )
+
+    assert session.planner is not None
+
+
+def test_dynamic_rvg_rejects_obstacles_outside_workspace_cleanly() -> None:
+    workspace = WorkspaceConfig(
+        width=20.0,
+        height=20.0,
+        car_width=1.0,
+        car_height=1.0,
+        offset_w=0.5,
+        offset_h=0.5,
+        wheel_base=1.0,
+        max_wheel_speed=1.0,
+        frequency=30.0,
+        car_id_list=[1],
+    )
+
+    with pytest.raises(ValueError, match="crosses the workspace boundary"):
+        DynamicRVGSession(
+            workspace,
+            [[(-0.5, 5.0), (2.0, 5.0), (2.0, 8.0), (-0.5, 8.0)]],
+            DynamicRVGSettings(resolution=4),
+        )
+
+
+def test_actual_size_pose_can_be_valid_inside_planning_margin() -> None:
+    workspace = WorkspaceConfig(
+        width=20.0,
+        height=20.0,
+        car_width=1.0,
+        car_height=1.0,
+        offset_w=0.5,
+        offset_h=0.5,
+        wheel_base=1.0,
+        max_wheel_speed=1.0,
+        frequency=30.0,
+        car_id_list=[1],
+    )
+    session = DynamicRVGSession(
+        workspace,
+        [[(6.0, 4.0), (8.0, 4.0), (8.0, 6.0), (6.0, 6.0)]],
+        DynamicRVGSettings(resolution=4, robot_geometry_scale=1.2),
+    )
+    pose = (5.45, 5.0, 0.0)
+
+    assert session.pose_is_valid(pose, robot_geometry_scale=1.0)
+    assert not session.pose_is_valid(pose, robot_geometry_scale=1.2)
