@@ -38,9 +38,13 @@ class CameraOverlayCanvas(MVPCanvas):
         workspace_to_image: WorkspaceProjector,
         image_to_workspace: ImageProjector,
         parent: Optional[QWidget] = None,
+        workspace_boundary_height_cm: float = 0.0,
     ) -> None:
         self._workspace_to_image = workspace_to_image
         self._image_to_workspace = image_to_workspace
+        self._workspace_boundary_height_cm = max(
+            0.0, float(workspace_boundary_height_cm)
+        )
         self._camera_width = 0
         self._camera_height = 0
         self._camera_scale = 1.0
@@ -145,28 +149,58 @@ class CameraOverlayCanvas(MVPCanvas):
             return super().workspace_to_pixel(wx, wy)
         return self._image_to_scene_pixel(*projected)
 
+    def set_workspace_boundary_height(self, height_cm: float) -> None:
+        """Update the boundary projection plane and redraw it immediately."""
+        self._workspace_boundary_height_cm = max(0.0, float(height_cm))
+        self._draw_workspace_boundary()
+
     def _update_drawing_geometry(self, item: Any, drawing: Dict[str, Any]) -> None:
-        """Apply optional height only to drawings that explicitly request it."""
+        """Apply optional height to path and filled-region geometry."""
         super()._update_drawing_geometry(item, drawing)
         height_cm = float(drawing.get("projection_height_cm", 0.0))
-        if (
-            height_cm == 0.0
-            or drawing.get("type") != "path"
-            or not isinstance(item, QGraphicsPathItem)
-        ):
+        if height_cm == 0.0 or not isinstance(item, QGraphicsPathItem):
             return
 
-        points = drawing.get("points", [])
-        path = QPainterPath()
-        if points:
-            px, py = self.workspace_to_pixel_at_height(
-                points[0][0], points[0][1], height_cm
-            )
-            path.moveTo(px, py)
-            for x, y in points[1:]:
-                px, py = self.workspace_to_pixel_at_height(x, y, height_cm)
-                path.lineTo(px, py)
-        item.setPath(path)
+        drawing_type = drawing.get("type")
+        if drawing_type == "path":
+            points = drawing.get("points", [])
+            path = QPainterPath()
+            if points:
+                px, py = self.workspace_to_pixel_at_height(
+                    points[0][0], points[0][1], height_cm
+                )
+                path.moveTo(px, py)
+                for x, y in points[1:]:
+                    px, py = self.workspace_to_pixel_at_height(x, y, height_cm)
+                    path.lineTo(px, py)
+            item.setPath(path)
+            return
+
+        if drawing_type != "region":
+            return
+
+        combined_path = QPainterPath()
+        for region in drawing.get("regions", []):
+            region_path = QPainterPath()
+            region_path.setFillRule(Qt.FillRule.OddEvenFill)
+            for points in [region.get("outer", [])] + list(
+                region.get("holes", [])
+            ):
+                if len(points) < 3:
+                    continue
+                px, py = self.workspace_to_pixel_at_height(
+                    points[0][0], points[0][1], height_cm
+                )
+                region_path.moveTo(px, py)
+                for x, y in points[1:]:
+                    px, py = self.workspace_to_pixel_at_height(x, y, height_cm)
+                    region_path.lineTo(px, py)
+                region_path.closeSubpath()
+            if combined_path.isEmpty():
+                combined_path = region_path
+            else:
+                combined_path = combined_path.united(region_path)
+        item.setPath(combined_path)
 
     def pixel_to_workspace(self, px: float, py: float) -> Point:
         if self._camera_width <= 0 or self._camera_height <= 0:
@@ -215,7 +249,12 @@ class CameraOverlayCanvas(MVPCanvas):
             (self._ws_config.width, self._ws_config.height),
             (0.0, self._ws_config.height),
         ]
-        pixels = [self.workspace_to_pixel(x, y) for x, y in corners]
+        pixels = [
+            self.workspace_to_pixel_at_height(
+                x, y, self._workspace_boundary_height_cm
+            )
+            for x, y in corners
+        ]
         if not all(math.isfinite(value) for point in pixels for value in point):
             return
         path = QPainterPath()
@@ -255,10 +294,25 @@ class CameraOverlayWindow(MVPWindow):
         self._environment.set_frame_callback(self._receive_frame)
 
     def _create_canvas(self) -> CameraOverlayCanvas:
+        canvas_config = self._gui_config.get("canvas", {})
         return CameraOverlayCanvas(
             self._ws_config,
             self._environment.workspace_to_image_pixel,
             self._environment.image_pixel_to_workspace,
+            workspace_boundary_height_cm=float(
+                canvas_config.get("workspace_boundary_height_cm", 0.0)
+            ),
+        )
+
+    def set_workspace_boundary_on_floor(self, enabled: bool) -> None:
+        """Toggle the boundary between its configured plane and the floor."""
+        configured_height = float(
+            self._gui_config.get("canvas", {}).get(
+                "workspace_boundary_height_cm", 0.0
+            )
+        )
+        self._canvas.set_workspace_boundary_height(
+            0.0 if enabled else configured_height
         )
 
     def _receive_frame(self, frame: Any) -> None:

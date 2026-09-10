@@ -51,6 +51,8 @@ class ObserverConfig:
     fps: int = 60
     undistort: bool = False
     calibration_file: str = ""
+    autofocus_enabled: bool = True
+    focus_absolute: int = 0
 
     # ArUco dictionaries
     car_dict: str = "DICT_4X4_50"
@@ -72,6 +74,7 @@ class ObserverConfig:
 
     # Workspace estimation
     workspace_margin_cm: float = 1.0
+    workspace_bounds_scale: float = 1.0
     workspace_min_side_cm: float = 10.0
 
     # Workspace lock: multi-frame aggregation
@@ -112,6 +115,8 @@ class ObserverConfig:
             fps=cfg.require("camera.fps", int, who=who),
             undistort=cfg.require("camera.undistort", bool, who=who),
             calibration_file=cfg.require("camera.calibration_file", str, who=who),
+            autofocus_enabled=cfg.require("camera.autofocus", bool, who=who),
+            focus_absolute=cfg.require("camera.focus_absolute", int, who=who),
             warmup_frames=cfg.require("camera.warmup_frames", int, who=who),
             no_preview=not cfg.require("camera.preview", bool, who=who),
             car_dict=cfg.require("car.aruco_dict", str, who=who),
@@ -128,6 +133,9 @@ class ObserverConfig:
             ),
             obstacle_shapes=_obstacle_shapes(cfg, who),
             workspace_margin_cm=cfg.require("workspace.margin_cm", float, who=who),
+            workspace_bounds_scale=cfg.require(
+                "workspace.bounds_scale", float, who=who
+            ),
             workspace_min_side_cm=cfg.require("workspace.min_side_cm", float, who=who),
             workspace_lock_frames=cfg.require("workspace.lock_frames", int, who=who),
             workspace_width_tolerance_cm=cfg.require(
@@ -299,6 +307,8 @@ class ArucoObserver:
     """Camera observer with adaptive ground-plane workspace estimation."""
 
     def __init__(self, config: ObserverConfig) -> None:
+        if not 0.0 < config.workspace_bounds_scale <= 1.0:
+            raise ValueError("workspace.bounds_scale must be in (0, 1]")
         self._config = config
         self._running = False
 
@@ -821,6 +831,23 @@ class ArucoObserver:
         if rect is None:
             return WorkspaceEstimate()
 
+        scale = self._config.workspace_bounds_scale
+        if scale < 1.0:
+            left, bottom = rect[0]
+            right, top = rect[2]
+            inset_x = (right - left) * (1.0 - scale) / 2.0
+            inset_y = (top - bottom) * (1.0 - scale) / 2.0
+            left += inset_x
+            right -= inset_x
+            bottom += inset_y
+            top -= inset_y
+            rect = [
+                (left, bottom),
+                (right, bottom),
+                (right, top),
+                (left, top),
+            ]
+
         width_cm = rect[1][0] - rect[0][0]
         height_cm = rect[3][1] - rect[0][1]
         if width_cm < self._config.workspace_min_side_cm or height_cm < self._config.workspace_min_side_cm:
@@ -1331,6 +1358,14 @@ class ArucoObserver:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         cap.set(cv2.CAP_PROP_FPS, self._config.fps)
         cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+        autofocus_value = 1.0 if self._config.autofocus_enabled else 0.0
+        if not cap.set(cv2.CAP_PROP_AUTOFOCUS, autofocus_value):
+            print("[Observer] Warning: camera did not accept the autofocus setting")
+        if (
+            not self._config.autofocus_enabled
+            and not cap.set(cv2.CAP_PROP_FOCUS, self._config.focus_absolute)
+        ):
+            print("[Observer] Warning: camera did not accept the manual focus setting")
         return cap
 
     @staticmethod

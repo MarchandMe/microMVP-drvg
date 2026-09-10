@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--obstacle-capture-seconds",
         type=float,
-        default=2.0,
-        help="Time used to collect the fixed obstacle snapshot (default: 2)",
+        default=1.0,
+        help="Time used to collect the fixed obstacle snapshot (default: 1)",
     )
     parser.add_argument(
         "--goal-heading",
@@ -215,6 +215,7 @@ class DynamicRVGRealNavigator:
         self.obstacle_draw_height_cm = max(
             0.0, float(obstacle_draw_height_cm)
         )
+        self._draw_overlays_on_floor = False
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
@@ -303,6 +304,11 @@ class DynamicRVGRealNavigator:
     def set_controller_speed(self, speed: float) -> None:
         with self._lock:
             self.controller.set_speed(speed)
+
+    def set_overlay_projection_to_floor(self, enabled: bool) -> None:
+        """Switch scan and obstacle drawings between object and floor planes."""
+        with self._lock:
+            self._draw_overlays_on_floor = bool(enabled)
 
     def cancel(self, reason: str = "Run cancelled") -> None:
         with self._lock:
@@ -671,6 +677,11 @@ class DynamicRVGRealNavigator:
 
     def _gui_drawings(self) -> list[dict[str, Any]]:
         drawings: list[dict[str, Any]] = []
+        overlay_height_cm = (
+            0.0
+            if self._draw_overlays_on_floor
+            else self.obstacle_draw_height_cm
+        )
         if self._scanned_regions:
             drawings.append(
                 {
@@ -684,6 +695,7 @@ class DynamicRVGRealNavigator:
                     "fill": "#40D6A20B",
                     "width": 1,
                     "z": -10,
+                    "projection_height_cm": overlay_height_cm,
                 }
             )
 
@@ -694,7 +706,7 @@ class DynamicRVGRealNavigator:
                 "#FF6600",
                 3,
             )
-            drawing["projection_height_cm"] = self.obstacle_draw_height_cm
+            drawing["projection_height_cm"] = overlay_height_cm
             drawings.append(drawing)
 
         for index, segment in enumerate(self.planned_segments):
@@ -979,7 +991,10 @@ def main(
         raise
 
     gui_config = {
-        "canvas": {"click_canvas_callback": True},
+        "canvas": {
+            "click_canvas_callback": True,
+            "workspace_boundary_height_cm": obstacle_draw_height_cm,
+        },
         "control_panel": [
             {"type": "label", "text": "=== Real DynamicRVG ==="},
             {
@@ -1036,6 +1051,12 @@ def main(
                 "callback_name": "recapture_obstacles",
             },
             {
+                "type": "toggle",
+                "label": "Draw geometry on floor",
+                "default": False,
+                "callback_name": "set_overlay_projection_to_floor",
+            },
+            {
                 "type": "label",
                 "text": "Click canvas: rescan obstacles, then start",
             },
@@ -1084,6 +1105,14 @@ def main(
             recapture_requested.set()
             environment.stop_all()
 
+    def set_overlay_projection_to_floor(enabled: bool) -> None:
+        navigator.set_overlay_projection_to_floor(enabled)
+        set_boundary_on_floor = getattr(
+            gui, "set_workspace_boundary_on_floor", None
+        )
+        if callable(set_boundary_on_floor):
+            set_boundary_on_floor(enabled)
+
     def on_key_press(key: str) -> None:
         if key == "escape":
             environment.stop_all()
@@ -1103,6 +1132,10 @@ def main(
         "cancel_run", lambda: stop_and_cancel("Run cancelled; robot stopped")
     )
     gui.register_callback("recapture_obstacles", request_recapture)
+    gui.register_callback(
+        "set_overlay_projection_to_floor",
+        set_overlay_projection_to_floor,
+    )
     gui.register_callback("on_key_press", on_key_press)
 
     latest_observations: dict[int, RobotObservation] = {}

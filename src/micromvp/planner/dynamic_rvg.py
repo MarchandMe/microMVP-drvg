@@ -32,6 +32,7 @@ PLANNER_MODES = (
 )
 SCAN_MODES = ("center", "footprint")
 _GEOMETRY_EPSILON = 1e-9
+_BORDER_ATTACHMENT_EPSILON_CM = 1e-4
 
 
 def _cross_product(origin: Point, first: Point, second: Point) -> float:
@@ -216,6 +217,148 @@ def pad_obstacles(
     ]
 
 
+def _clip_polygon_to_axis(
+    polygon: Sequence[Point],
+    axis: int,
+    bound: float,
+    keep_greater: bool,
+) -> list[Point]:
+    """Clip a polygon against one axis-aligned half-plane."""
+    if not polygon:
+        return []
+
+    def inside(point: Point) -> bool:
+        value = point[axis]
+        return value >= bound if keep_greater else value <= bound
+
+    clipped: list[Point] = []
+    previous = polygon[-1]
+    previous_inside = inside(previous)
+    for current in polygon:
+        current_inside = inside(current)
+        if current_inside != previous_inside:
+            denominator = current[axis] - previous[axis]
+            if abs(denominator) > _GEOMETRY_EPSILON:
+                fraction = (bound - previous[axis]) / denominator
+                intersection = (
+                    previous[0] + fraction * (current[0] - previous[0]),
+                    previous[1] + fraction * (current[1] - previous[1]),
+                )
+                clipped.append(intersection)
+        if current_inside:
+            clipped.append(current)
+        previous = current
+        previous_inside = current_inside
+    return clipped
+
+
+def _clean_polygon_points(polygon: Sequence[Point]) -> list[Point]:
+    """Remove duplicate and redundant collinear clipping vertices."""
+    cleaned: list[Point] = []
+    for point in polygon:
+        candidate = (float(point[0]), float(point[1]))
+        if cleaned and math.dist(candidate, cleaned[-1]) <= _GEOMETRY_EPSILON:
+            continue
+        cleaned.append(candidate)
+    if (
+        len(cleaned) >= 2
+        and math.dist(cleaned[0], cleaned[-1]) <= _GEOMETRY_EPSILON
+    ):
+        cleaned.pop()
+
+    changed = True
+    while changed and len(cleaned) >= 3:
+        changed = False
+        simplified: list[Point] = []
+        for index, current in enumerate(cleaned):
+            previous = cleaned[index - 1]
+            following = cleaned[(index + 1) % len(cleaned)]
+            if abs(_cross_product(previous, current, following)) <= (
+                _GEOMETRY_EPSILON
+            ) and _point_on_segment(current, previous, following):
+                changed = True
+                continue
+            simplified.append(current)
+        cleaned = simplified
+
+    if len(cleaned) < 3:
+        return []
+    signed_area = 0.5 * sum(
+        cleaned[index][0] * cleaned[(index + 1) % len(cleaned)][1]
+        - cleaned[(index + 1) % len(cleaned)][0] * cleaned[index][1]
+        for index in range(len(cleaned))
+    )
+    if abs(signed_area) <= _GEOMETRY_EPSILON:
+        return []
+    if signed_area < 0.0:
+        cleaned.reverse()
+    return cleaned
+
+
+def attach_obstacles_to_workspace_border(
+    workspace: WorkspaceConfig,
+    obstacles: Sequence[PolygonPoints],
+) -> tuple[list[list[Point]], int]:
+    """Prepare visible obstacles that touch or cross the workspace border.
+
+    DRVG inserts the raw border and obstacle edges as non-intersecting CGAL
+    constraints, so an observed obstacle cannot literally cross that border.
+    Border obstacles are clipped a microscopic distance inside the workspace.
+    DRVG's subsequent robot-footprint expansion then joins them to the outside
+    border in configuration space, producing the intended boundary indentation
+    without creating an unsafe navigable gap.
+    """
+    width = float(workspace.width)
+    height = float(workspace.height)
+    if width <= 0.0 or height <= 0.0:
+        raise ValueError("workspace dimensions must be positive")
+    inset = min(
+        _BORDER_ATTACHMENT_EPSILON_CM,
+        0.001 * width,
+        0.001 * height,
+    )
+    minimum_x, maximum_x = inset, width - inset
+    minimum_y, maximum_y = inset, height - inset
+    if minimum_x >= maximum_x or minimum_y >= maximum_y:
+        raise ValueError("workspace is too small to attach border obstacles")
+
+    prepared: list[list[Point]] = []
+    attached_count = 0
+    for polygon_index, obstacle in enumerate(obstacles):
+        if len(obstacle) < 3:
+            continue
+        points: list[Point] = []
+        for point_index, (x, y) in enumerate(obstacle):
+            point = (float(x), float(y))
+            if not math.isfinite(point[0]) or not math.isfinite(point[1]):
+                raise ValueError(
+                    f"obstacle {polygon_index} point {point_index} is not finite"
+                )
+            points.append(point)
+
+        intersects_border = any(
+            x <= 0.0 or x >= width or y <= 0.0 or y >= height
+            for x, y in points
+        )
+        if not intersects_border:
+            prepared.append(points)
+            continue
+
+        clipped: list[Point] = points
+        clipped = _clip_polygon_to_axis(clipped, 0, minimum_x, True)
+        clipped = _clip_polygon_to_axis(clipped, 0, maximum_x, False)
+        clipped = _clip_polygon_to_axis(clipped, 1, minimum_y, True)
+        clipped = _clip_polygon_to_axis(clipped, 1, maximum_y, False)
+        clipped = _clean_polygon_points(clipped)
+        if len(clipped) < 3:
+            # A registered obstacle wholly outside the usable workspace does
+            # not remove any free space and is safe to ignore.
+            continue
+        prepared.append(clipped)
+        attached_count += 1
+    return prepared, attached_count
+
+
 def _merge_intersecting_rvg_polygons(polygons: Sequence[Any]) -> list[Any]:
     """Union polygons whose boundaries cross before DRVG builds its arrangement."""
     merged: list[Any] = []
@@ -324,13 +467,24 @@ class DynamicRVGSession:
             self._rvg.vertex(0.0, 0.0),
             False,
         )
-        obstacle_points = [
+        detected_obstacle_points = [
             [(float(x), float(y)) for x, y in obstacle]
             for obstacle in obstacles
             if len(obstacle) >= 3
         ]
+        obstacle_points, border_attached_count = (
+            attach_obstacles_to_workspace_border(
+                workspace,
+                detected_obstacle_points,
+            )
+        )
         self._obstacle_points = obstacle_points
-        self._validate_obstacle_bounds(workspace, obstacle_points)
+        if border_attached_count:
+            print(
+                f"[DynamicRVG] Merged {border_attached_count} visible "
+                "border-intersecting obstacle polygon(s) into the workspace "
+                "boundary"
+            )
         world_obstacles = [
             self._rvg.polygon(
                 [self._rvg.vertex(x, y) for x, y in obstacle], False
@@ -362,24 +516,8 @@ class DynamicRVGSession:
         if not self._planner.setPlannerMode(planner_mode):
             raise RuntimeError("DynamicRVG rejected planner mode")
         self._scan_mode = self._scan_mode_value(settings.scan_mode)
-
-    @staticmethod
-    def _validate_obstacle_bounds(
-        workspace: WorkspaceConfig,
-        obstacles: Sequence[PolygonPoints],
-    ) -> None:
-        for polygon_index, obstacle in enumerate(obstacles):
-            for point_index, (x, y) in enumerate(obstacle):
-                if not math.isfinite(x) or not math.isfinite(y):
-                    raise ValueError(
-                        f"obstacle {polygon_index} point {point_index} is not finite"
-                    )
-                if 0.0 <= x <= workspace.width and 0.0 <= y <= workspace.height:
-                    continue
-                raise ValueError(
-                    f"obstacle {polygon_index} crosses the workspace boundary at "
-                    f"({x:.3f}, {y:.3f}); move it inward or reduce obstacle padding"
-                )
+        self._current_pose: Pose | None = None
+        self._goal_pose: Pose | None = None
 
     def _temporary_goal_options(
         self, settings: DynamicRVGSettings
@@ -448,10 +586,13 @@ class DynamicRVGSession:
         return self._planner
 
     def initialize(self, start: Pose, goal: Pose) -> None:
+        self._current_pose = start
+        self._goal_pose = goal
         self._planner.initialize(self._vertex(start), self._vertex(goal))
 
     def update_pose(self, pose: Pose | RobotObservation) -> None:
         measured_pose = pose.pose if isinstance(pose, RobotObservation) else pose
+        self._current_pose = measured_pose
         self._planner.updateRobotPose(self._vertex(measured_pose))
 
     def pose_is_valid(
@@ -490,25 +631,117 @@ class DynamicRVGSession:
             for obstacle in self._obstacle_points
         )
 
+    def _rotation_is_valid(
+        self,
+        position: Point,
+        start_heading: float,
+        end_heading: float,
+    ) -> bool:
+        """Check an in-place rotation at five-degree intervals."""
+        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
+        steps = max(1, math.ceil(abs(delta) / 5.0))
+        return all(
+            self.pose_is_valid(
+                (
+                    position[0],
+                    position[1],
+                    start_heading + delta * index / steps,
+                ),
+                robot_geometry_scale=self._settings.robot_geometry_scale,
+            )
+            for index in range(steps + 1)
+        )
+
+    def _direct_goal_path_is_valid(self) -> bool:
+        """Return whether rotate/translate/rotate can reach the goal directly."""
+        if self._current_pose is None or self._goal_pose is None:
+            return False
+
+        start_x, start_y, start_heading = self._current_pose
+        goal_x, goal_y, goal_heading = self._goal_pose
+        delta_x = goal_x - start_x
+        delta_y = goal_y - start_y
+        distance = math.hypot(delta_x, delta_y)
+        if distance <= _GEOMETRY_EPSILON:
+            return self._rotation_is_valid(
+                (start_x, start_y), start_heading, goal_heading
+            )
+
+        travel_heading = math.degrees(math.atan2(delta_y, delta_x))
+        if not self._rotation_is_valid(
+            (start_x, start_y), start_heading, travel_heading
+        ):
+            return False
+        if not self._rotation_is_valid(
+            (goal_x, goal_y), travel_heading, goal_heading
+        ):
+            return False
+
+        # Closely sample the translated planning footprint. The registered
+        # obstacles are already padded by the deployment safety margin, and
+        # pose_is_valid applies the configured robot-geometry scale as well.
+        sample_spacing = max(
+            0.1,
+            0.1 * min(self._workspace.car_width, self._workspace.car_height),
+        )
+        steps = max(1, math.ceil(distance / sample_spacing))
+        return all(
+            self.pose_is_valid(
+                (
+                    start_x + delta_x * index / steps,
+                    start_y + delta_y * index / steps,
+                    travel_heading,
+                ),
+                robot_geometry_scale=self._settings.robot_geometry_scale,
+            )
+            for index in range(steps + 1)
+        )
+
     def scan(self) -> Any:
         return self._planner.scan(self._scan_mode)
 
     def step(self) -> DynamicRVGPlan:
         result = self._planner.step(self._scan_mode)
         configurations = list(result.path)
+        status = result.status
+
+        # Prefer the original goal whenever the full scaled footprint has a
+        # clear direct corridor. This also handles DRVG's empty-world result,
+        # which is NoTemporaryGoal with an empty path. Preserve the scan above
+        # for visualization, but skip exploratory temporary goals and detours.
+        direct_goal_path = (
+            status
+            in {
+                self._rvg.PyDynamicRVGStatus.GoalPathAvailable,
+                self._rvg.PyDynamicRVGStatus.TemporaryGoalPathAvailable,
+                self._rvg.PyDynamicRVGStatus.NoTemporaryGoal,
+            }
+            and self._direct_goal_path_is_valid()
+        )
+        if direct_goal_path:
+            assert self._current_pose is not None
+            assert self._goal_pose is not None
+            configurations = [
+                self._vertex(self._current_pose),
+                self._vertex(self._goal_pose),
+            ]
+            status = self._rvg.PyDynamicRVGStatus.GoalPathAvailable
+        else:
+            configurations = self._collapse_redundant_full_turns(configurations)
+
         temporary_goal = None
-        if result.temporaryGoal is not None:
+        if not direct_goal_path and result.temporaryGoal is not None:
             temporary_goal = (
                 result.temporaryGoal.getX(),
                 result.temporaryGoal.getY(),
             )
         return DynamicRVGPlan(
-            status=result.status,
+            status=status,
             configurations=configurations,
             controller_path=self._to_controller_path(configurations),
             temporary_goal=temporary_goal,
             final_segment=(
-                result.status == self._rvg.PyDynamicRVGStatus.GoalPathAvailable
+                status == self._rvg.PyDynamicRVGStatus.GoalPathAvailable
             ),
         )
 
@@ -536,6 +769,70 @@ class DynamicRVGSession:
     @staticmethod
     def _polygon_points(polygon: Any) -> list[Point]:
         return [(vertex.getX(), vertex.getY()) for vertex in polygon.getVertices()]
+
+    def _collapse_redundant_full_turns(
+        self,
+        configurations: Sequence[Any],
+    ) -> list[Any]:
+        """Remove same-position RVG rotations that take the long way around.
+
+        RVG's graph cost currently uses the absolute difference between two
+        angles. Around the 0/2pi seam that can select, for example,
+        1, 5, 15, ..., 355 degrees instead of the equivalent -6-degree turn.
+        Only collapse such a run when the short in-place rotation is valid for
+        the full scaled footprint; a deliberately long collision-avoiding
+        rotation must remain intact.
+        """
+        collapsed: list[Any] = []
+        index = 0
+        while index < len(configurations):
+            run_end = index
+            start = configurations[index]
+            while run_end + 1 < len(configurations):
+                candidate = configurations[run_end + 1]
+                if (
+                    abs(candidate.getX() - start.getX()) > 1e-6
+                    or abs(candidate.getY() - start.getY()) > 1e-6
+                ):
+                    break
+                run_end += 1
+
+            run = list(configurations[index : run_end + 1])
+            if len(run) >= 3:
+                wrapped_travel = sum(
+                    abs(
+                        math.atan2(
+                            math.sin(
+                                run[offset].getTheta()
+                                - run[offset - 1].getTheta()
+                            ),
+                            math.cos(
+                                run[offset].getTheta()
+                                - run[offset - 1].getTheta()
+                            ),
+                        )
+                    )
+                    for offset in range(1, len(run))
+                )
+                shortest_delta = math.atan2(
+                    math.sin(run[-1].getTheta() - run[0].getTheta()),
+                    math.cos(run[-1].getTheta() - run[0].getTheta()),
+                )
+                redundant_revolution = (
+                    wrapped_travel - abs(shortest_delta) > math.pi
+                )
+                if redundant_revolution:
+                    short_rotation_valid = self._rotation_is_valid(
+                        (start.getX(), start.getY()),
+                        math.degrees(run[0].getTheta()),
+                        math.degrees(run[-1].getTheta()),
+                    )
+                    if short_rotation_valid:
+                        run = [run[0], run[-1]]
+
+            collapsed.extend(run)
+            index = run_end + 1
+        return collapsed
 
     def _to_controller_path(self, configurations: Sequence[Any]) -> list[Point]:
         """Project an SE(2) RVG path to NavigationController waypoints."""

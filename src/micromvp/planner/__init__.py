@@ -7,6 +7,7 @@ from .dynamic_rvg import (
     DynamicRVGPlan,
     DynamicRVGSession,
     DynamicRVGSettings,
+    attach_obstacles_to_workspace_border,
     pad_obstacle_polygon,
     pad_obstacles,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "PLANNER_MODES",
     "SCAN_MODES",
     "TEMPORARY_GOAL_STRATEGIES",
+    "attach_obstacles_to_workspace_border",
     "pad_obstacle_polygon",
     "pad_obstacles",
 ]

@@ -50,7 +50,7 @@ car:
 # -----------------------------------------------------------------------------
 obstacle:
   aruco_dict: DICT_5X5_50
-  marker_size_mm: 30.0
+  marker_size_mm: 26.5
 
   # Height of the obstacle marker above the floor, i.e. how tall the block is.
   # Set 0.0 if the markers lie flat on the ground.
@@ -92,9 +92,14 @@ obstacle:
 # Camera
 # -----------------------------------------------------------------------------
 camera:
-  device: 12
+  device: 0
   resolution: 720p          # 480p | 720p | 1080p
-  fps: 60
+  fps: 30
+
+  # The C920 hunts on this mostly featureless workspace. Focus 0 was selected
+  # by a live sharpness sweep over the visible ArUco markers.
+  autofocus: false
+  focus_absolute: 0
 
   # Intrinsics, produced by calibration/calibrate_camera.py. The resolution
   # recorded in this file must match `resolution` above or startup aborts.
@@ -123,7 +128,11 @@ camera:
 # -----------------------------------------------------------------------------
 workspace:
   # Shrink each side by this much, to keep robots off the very edge of view.
-  margin_cm: 1.0
+  margin_cm: 3
+
+  # Scale the detected workspace rectangle about its centre after applying
+  # margin_cm. 0.95 insets each edge by 2.5% of the detected dimension.
+  bounds_scale: 1
 
   # Reject an estimate whose shorter side is below this — usually means too
   # few markers were visible to fit a sensible plane.
@@ -198,10 +207,14 @@ control:
 
   # Pure-pursuit lookahead. null derives it from the car size, which is
   # usually what you want; set a number in cm to override.
-  lookahead_cm: null
+  lookahead_cm: 8
 
   # Distance at which a waypoint counts as reached. null derives from car size.
   goal_tolerance_cm: 0.5
+
+  # Circular exponential smoothing for camera heading, 0 < alpha <= 1.
+  # Lower values reject more frame-to-frame jitter; 1 disables smoothing.
+  heading_filter_alpha: 0.35
 
   # Path resampling: neighbouring points are split until no gap exceeds
   # this fraction of the car size.

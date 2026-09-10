@@ -506,8 +506,11 @@ If the picture keeps going soft and then sharp again, the camera is hunting
 for focus — plain carpet or a bare table gives autofocus nothing to lock
 onto. Blurred frames detect no markers, and one frame without markers
 clears the accumulated window, so the count never reaches
-`workspace.lock_frames`. Put a sheet of white paper under the workspace, or
-use another camera.
+`workspace.lock_frames`. On cameras that expose standard focus controls, set
+`camera.autofocus: false` and choose `camera.focus_absolute` in the deployment
+YAML. The observer reapplies both settings whenever it opens the camera. Put a
+sheet of white paper under the workspace if the camera still cannot focus
+reliably.
 
 If the picture is steady and sharp, the cause is something else.
 

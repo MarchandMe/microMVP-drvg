@@ -15,6 +15,7 @@ from micromvp.core.models import (
 from micromvp.planner import (
     DynamicRVGPlan,
     DynamicRVGSettings,
+    attach_obstacles_to_workspace_border,
     pad_obstacle_polygon,
 )
 
@@ -31,6 +32,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 DynamicRVGRealNavigator = _MODULE.DynamicRVGRealNavigator
 capture_fixed_obstacles = _MODULE.capture_fixed_obstacles
+parse_args = _MODULE.parse_args
 
 
 class _RecordingPlanner:
@@ -103,6 +105,14 @@ class _Configuration:
         return self._theta
 
 
+def test_obstacle_capture_default_is_one_second(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["dynamic_rvg_navigation.py"])
+
+    args = parse_args()
+
+    assert args.obstacle_capture_seconds == 1.0
+
+
 def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> None:
     planner = _RecordingPlanner()
     monkeypatch.setattr(
@@ -167,13 +177,43 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
     )
     assert scanned_area["type"] == "region"
     assert len(scanned_area["regions"]) == 1
+    assert scanned_area["projection_height_cm"] == 4.0
     obstacle_drawing = next(
         drawing
         for drawing in navigator._gui_drawings()
         if drawing["uuid"] == "fixed_obstacle_0"
     )
     assert obstacle_drawing["projection_height_cm"] == 4.0
-    assert "projection_height_cm" not in scanned_area
+
+    navigator.set_overlay_projection_to_floor(True)
+    floor_drawings = navigator._gui_drawings()
+    floor_scan = next(
+        drawing
+        for drawing in floor_drawings
+        if drawing["uuid"] == "scanned_area"
+    )
+    floor_obstacle = next(
+        drawing
+        for drawing in floor_drawings
+        if drawing["uuid"] == "fixed_obstacle_0"
+    )
+    assert floor_scan["projection_height_cm"] == 0.0
+    assert floor_obstacle["projection_height_cm"] == 0.0
+
+    navigator.set_overlay_projection_to_floor(False)
+    raised_drawings = navigator._gui_drawings()
+    raised_scan = next(
+        drawing
+        for drawing in raised_drawings
+        if drawing["uuid"] == "scanned_area"
+    )
+    raised_obstacle = next(
+        drawing
+        for drawing in raised_drawings
+        if drawing["uuid"] == "fixed_obstacle_0"
+    )
+    assert raised_scan["projection_height_cm"] == 4.0
+    assert raised_obstacle["projection_height_cm"] == 4.0
 
     next_observation = RobotObservation(
         robot_id=3,
@@ -222,6 +262,47 @@ def test_obstacle_padding_offsets_convex_and_concave_edges() -> None:
             (-0.5, 4.5),
         ]
     )
+
+
+def test_border_obstacles_are_attached_without_changing_interior_obstacles() -> None:
+    workspace = WorkspaceConfig(
+        width=20.0,
+        height=20.0,
+        car_width=1.0,
+        car_height=1.0,
+        offset_w=0.5,
+        offset_h=0.5,
+        wheel_base=1.0,
+        max_wheel_speed=1.0,
+        frequency=30.0,
+        car_id_list=[1],
+    )
+    border_obstacle = [
+        (-0.5, 5.0),
+        (2.0, 5.0),
+        (2.0, 8.0),
+        (-0.5, 8.0),
+    ]
+    interior_obstacle = [
+        (10.0, 10.0),
+        (12.0, 10.0),
+        (12.0, 12.0),
+        (10.0, 12.0),
+    ]
+
+    prepared, attached_count = attach_obstacles_to_workspace_border(
+        workspace,
+        [border_obstacle, interior_obstacle],
+    )
+
+    assert attached_count == 1
+    assert [point[0] for point in prepared[0]] == pytest.approx(
+        [0.0001, 2.0, 2.0, 0.0001]
+    )
+    assert [point[1] for point in prepared[0]] == pytest.approx(
+        [5.0, 5.0, 8.0, 8.0]
+    )
+    assert prepared[1] == interior_obstacle
 
 
 def test_obstacle_capture_clears_the_previous_snapshot() -> None:

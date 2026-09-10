@@ -4,7 +4,9 @@ Unit tests for the workspace lock state machine and aggregation logic.
 All tests are pure algorithm tests – no camera or hardware required.
 """
 import time
+from unittest.mock import Mock
 
+import cv2
 import numpy as np
 import pytest
 
@@ -50,6 +52,27 @@ def _default_config(**overrides) -> ObserverConfig:
     )
     defaults.update(overrides)
     return ObserverConfig(**defaults)
+
+
+class TestCameraFocusConfiguration:
+    def test_manual_focus_is_applied_when_camera_opens(self, monkeypatch):
+        capture = Mock()
+        capture.set.return_value = True
+        monkeypatch.setattr(cv2, "VideoCapture", Mock(return_value=capture))
+        monkeypatch.setattr("platform.system", lambda: "Linux")
+        observer = ArucoObserver(
+            _default_config(
+                resolution="720p",
+                fps=30,
+                autofocus_enabled=False,
+                focus_absolute=0,
+            )
+        )
+
+        assert observer._open_camera() is capture
+        capture.set.assert_any_call(cv2.CAP_PROP_FPS, 30)
+        capture.set.assert_any_call(cv2.CAP_PROP_AUTOFOCUS, 0.0)
+        capture.set.assert_any_call(cv2.CAP_PROP_FOCUS, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +248,50 @@ class TestMarkerOffsetTransform:
 
 
 class TestCameraWorkspaceProjection:
+    def test_workspace_bounds_scale_insets_about_center(self, monkeypatch):
+        observer = ArucoObserver(
+            _default_config(
+                workspace_margin_cm=0.0,
+                workspace_bounds_scale=0.95,
+                workspace_min_side_cm=10.0,
+            )
+        )
+        monkeypatch.setattr(
+            observer,
+            "_estimate_floor_plane",
+            lambda _markers: (
+                np.array([0.0, 0.0, 1.0]),
+                np.array([0.0, 0.0, 1.0]),
+            ),
+        )
+        monkeypatch.setattr(
+            observer,
+            "_project_image_corners_to_plane",
+            lambda *_args: [(0.0, 0.0)] * 4,
+        )
+        monkeypatch.setattr(
+            observer,
+            "_inscribed_rect",
+            lambda *_args: [
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 60.0),
+                (0.0, 60.0),
+            ],
+        )
+
+        workspace = observer._estimate_workspace([object()])
+
+        assert workspace.ready
+        assert workspace.width_cm == pytest.approx(95.0)
+        assert workspace.height_cm == pytest.approx(57.0)
+        assert workspace.origin_cam_m == pytest.approx((0.025, -0.015, 1.0))
+
+    @pytest.mark.parametrize("scale", [0.0, -0.1, 1.01])
+    def test_workspace_bounds_scale_must_only_shrink(self, scale):
+        with pytest.raises(ValueError, match="workspace.bounds_scale"):
+            ArucoObserver(_default_config(workspace_bounds_scale=scale))
+
     def test_raw_image_projection_round_trip(self):
         observer = ArucoObserver(_default_config())
         observer._K = np.array(

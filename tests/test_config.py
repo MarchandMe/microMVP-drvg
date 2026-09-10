@@ -32,6 +32,9 @@ class TestLookup:
     def test_reads_a_deeply_nested_field(self, cfg):
         assert cfg.require("workspace.tolerance.origin_m", float) == 0.01
 
+    def test_reads_workspace_bounds_scale(self, cfg):
+        assert cfg.require("workspace.bounds_scale", float) == 0.95
+
     def test_require_pair_returns_floats(self, cfg):
         assert cfg.require_pair("car.marker_to_axle_offset_cm") == (0.0, 1.8)
 
@@ -145,6 +148,9 @@ class TestShippedConfigIsComplete:
         observer = ObserverConfig.from_config(Config(data, SHIPPED_CONFIG))
         assert observer.car_marker_size_mm > 0
         assert observer.obstacle_shapes  # at least one obstacle registered
+        assert observer.fps == 30
+        assert observer.autofocus_enabled is False
+        assert observer.focus_absolute == 0
 
         # Pin the port so this test does not depend on what happens to be
         # plugged into the machine running it.

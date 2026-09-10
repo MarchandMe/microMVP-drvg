@@ -129,6 +129,9 @@ class NavigationController(Controller):
             goal_tolerance=cfg.require("control.goal_tolerance_cm", who=who),
             max_point_gap_ratio=cfg.require("control.max_point_gap_ratio", float, who=who),
             no_skip_ratio=cfg.require("control.no_skip_ratio", float, who=who),
+            heading_filter_alpha=cfg.require(
+                "control.heading_filter_alpha", float, who=who
+            ),
         )
         controller.ROTATION_TOLERANCE_DEG = cfg.require(
             "control.rotation.tolerance_deg", float, who=who
@@ -154,6 +157,7 @@ class NavigationController(Controller):
         # ---- PP+PD knobs (car_size-based, unit-insensitive) ----
         max_point_gap_ratio: float = 0.01,
         no_skip_ratio: float = 0.5,
+        heading_filter_alpha: float = 0.35,
     ) -> None:
         super().__init__(robot_id, ws_config)
 
@@ -166,6 +170,10 @@ class NavigationController(Controller):
         self._lookahead_distance = lookahead_distance or (0.5 * self.car_size)
         self._max_speed = min(1.0, max(0.0, max_speed))
         self._goal_tolerance = goal_tolerance or (0.2 * self.car_size)
+        if not 0.0 < heading_filter_alpha <= 1.0:
+            raise ValueError("heading_filter_alpha must be in (0, 1]")
+        self._heading_filter_alpha = float(heading_filter_alpha)
+        self._filtered_theta: Optional[float] = None
 
         # CTE-PD knobs
         self._cte_dot_alpha = 0.25
@@ -300,6 +308,7 @@ class NavigationController(Controller):
         self._rotation_stable_start = None
         self._on_rotation_done_callback = None
         self._car_state.metadata.pop("target_theta", None)
+        self._car_state.metadata.pop("rotation_error_deg", None)
 
         self.car_size = max(self._ws_config.car_width, self._ws_config.car_height)
 
@@ -381,6 +390,7 @@ class NavigationController(Controller):
             self._car_state.status_label = "IDLE"
 
         self._car_state.metadata.pop("target_theta", None)
+        self._car_state.metadata.pop("rotation_error_deg", None)
 
     def step(self, observation: RobotObservation) -> Action:
         self.update(observation)
@@ -394,7 +404,26 @@ class NavigationController(Controller):
 
         self._car_state.x = observation.x
         self._car_state.y = observation.y
-        self._car_state.theta = observation.theta  # degrees
+        measured_theta = observation.theta % 360.0
+        # Circular EMA: interpolate along the shortest angular displacement so
+        # samples around 359/0 degrees do not average to 180 degrees.
+        if (
+            self._filtered_theta is None
+            or prev_time is None
+            or observation.timestamp - prev_time > 0.5
+        ):
+            self._filtered_theta = measured_theta
+        else:
+            delta_theta = _wrap_to_pi(
+                math.radians(measured_theta - self._filtered_theta)
+            )
+            self._filtered_theta = (
+                self._filtered_theta
+                + self._heading_filter_alpha * math.degrees(delta_theta)
+            ) % 360.0
+        self._car_state.theta = self._filtered_theta
+        self._car_state.metadata["measured_theta"] = measured_theta
+        self._car_state.metadata["filtered_theta"] = self._filtered_theta
 
         if prev_time is not None and observation.timestamp > prev_time:
             dt = observation.timestamp - prev_time
@@ -404,7 +433,7 @@ class NavigationController(Controller):
                 distance = math.hypot(dx, dy)
                 self._car_state.linear_velocity = distance / dt
 
-                dtheta = observation.theta - prev_theta
+                dtheta = self._car_state.theta - prev_theta
                 if dtheta > 180:
                     dtheta -= 360
                 elif dtheta < -180:
@@ -436,15 +465,14 @@ class NavigationController(Controller):
             self._nav_state = NavigationState.IDLE
             self._car_state.status_label = "IDLE"
             self._car_state.metadata.pop("target_theta", None)
+            self._car_state.metadata.pop("rotation_error_deg", None)
             return Action.stop()
 
         current_theta = self._car_state.theta
-        error = self._target_theta - current_theta
-
-        while error > 180:
-            error -= 360
-        while error < -180:
-            error += 360
+        error = math.degrees(
+            _wrap_to_pi(math.radians(self._target_theta - current_theta))
+        )
+        self._car_state.metadata["rotation_error_deg"] = error
 
         if abs(error) <= self.ROTATION_TOLERANCE_DEG:
             now = time.time()
@@ -458,6 +486,7 @@ class NavigationController(Controller):
                 self._nav_state = NavigationState.ROTATION_DONE
                 self._car_state.status_label = "ROTATION_DONE"
                 self._car_state.metadata.pop("target_theta", None)
+                self._car_state.metadata.pop("rotation_error_deg", None)
 
                 if self._on_rotation_done_callback:
                     cb = self._on_rotation_done_callback
@@ -633,7 +662,10 @@ class NavigationController(Controller):
             cte_pd_curv = (kp * cte_n + kd * cte_dot_n) / max(self.car_size, 1e-9)
             cte_pd_curv = _clamp(cte_pd_curv, -curv_pd_max, curv_pd_max)
 
-        curvature_cmd = curvature_pp + cte_pd_curv
+        # cte_raw is positive on the left side of the path tangent. Positive
+        # curvature also turns left, so the recovery term must be subtracted
+        # to steer back toward the path rather than farther away from it.
+        curvature_cmd = curvature_pp - cte_pd_curv
         curvature_cmd = _clamp(curvature_cmd, -curvature_max, curvature_max)
 
         curv_slow = _clamp(1.0 - 0.65 * (abs(curvature_cmd) / max(curvature_max, 1e-9)), 0.35, 1.0)
@@ -832,6 +864,7 @@ class NavigationController(Controller):
         self._path_s = []
         self._path_index = 0
         self._prev_timestamp = None
+        self._filtered_theta = None
 
         self._prev_cte = None
         self._prev_cte_time = None
@@ -848,6 +881,7 @@ class NavigationController(Controller):
         self._car_state.metadata.pop("path_index", None)
         self._car_state.metadata.pop("target_point", None)
         self._car_state.metadata.pop("target_theta", None)
+        self._car_state.metadata.pop("rotation_error_deg", None)
 
     def set_speed(self, speed: float) -> None:
         self._max_speed = max(0.0, min(1.0, speed))

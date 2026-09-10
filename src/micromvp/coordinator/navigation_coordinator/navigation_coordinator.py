@@ -36,6 +36,7 @@ from micromvp.core.models import (
     RobotObservation,
     WorkspaceConfig,
 )
+from micromvp.planner.dynamic_rvg import attach_obstacles_to_workspace_border
 
 
 Point = Tuple[float, float]
@@ -401,7 +402,19 @@ class NavigationCoordinator(Coordinator):
 
             # --- obstacle polygons ---
             obstacle_polys = []
-            for obs in obstacles:
+            prepared_obstacles, border_attached_count = (
+                attach_obstacles_to_workspace_border(
+                    self._ws_config,
+                    obstacles,
+                )
+            )
+            if border_attached_count:
+                print(
+                    f"[NavigationCoordinator] Merged {border_attached_count} "
+                    "border-intersecting obstacle polygon(s) into "
+                    "the workspace boundary"
+                )
+            for obs in prepared_obstacles:
                 if len(obs) >= 3:
                     obs_verts = [vertex(pt[0], pt[1]) for pt in obs]
                     obstacle_polys.append(polygon(obs_verts, False))
