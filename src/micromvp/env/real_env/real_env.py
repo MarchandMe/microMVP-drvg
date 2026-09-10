@@ -95,6 +95,20 @@ class RealEnv(Environment):
 
         return True
 
+    def startup_status(self) -> dict:
+        """Expose workspace lock progress without promoting an unlocked estimate."""
+        observer = self._observer
+        estimate = observer.get_workspace_estimate()
+        return {
+            "locked": observer.is_workspace_ready(),
+            "progress": observer.get_workspace_lock_progress(),
+            "corner_progress": observer.get_workspace_corner_progress(),
+            "cars": observer.get_detected_car_ids(),
+            "candidate_ready": estimate.ready,
+            "width_cm": estimate.width_cm,
+            "height_cm": estimate.height_cm,
+        }
+
     def close(self) -> None:
         if not self._started:
             return

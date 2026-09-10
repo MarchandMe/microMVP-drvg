@@ -24,4 +24,5 @@ if __name__ == "__main__":
     navigation_main(
         window_factory=_create_overlay_window,
         render_environment=False,
+        camera_recording=True,
     )

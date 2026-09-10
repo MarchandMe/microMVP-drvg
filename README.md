@@ -422,9 +422,69 @@ The run writes `trajectory.png` and one planner graph per planning step under
 `examples/dynamic_rvg_navigation.py` uses the same persistent planner with
 `RealEnv`. At startup it captures one fixed obstacle snapshot from the ArUco
 observer. During a run, every measured robot pose is passed to DynamicRVG, one
-temporary segment is executed at a time, and the frontend acknowledges a
-segment only after the normal navigation controller reaches its position and
-terminal heading.
+temporary segment is executed at a time. Its SE(2) configurations are executed
+as explicit in-place turns and individual straight segments, including the
+terminal heading. Each translation can drive forward or backward: the executor
+chooses the direction requiring less turning while respecting the endpoint
+headings. A short backward step therefore does not force two half-turns.
+Reverse following keeps the measured body heading in the physical frame and
+swaps/negates virtual forward wheel commands.
+
+As in `examples/navigation.py`, a turn immediately preceding a drive hands off
+once it enters heading tolerance (`ROTATION_STABLE`). Final or standalone turns
+still wait for the configured settled completion. Intermediate turns are not
+converted into offset XY waypoints, and pure pursuit never looks ahead across
+a planned corner. The status line and console report turn error and drive
+direction. Rotation stopping uses the latest measured heading to avoid EMA
+lag during a turn; the path follower's smoothed heading is synchronized at
+handoff.
+
+The hardware demo uses `navigation.execution_collision_check: false`: it
+executes the turn/drive sequence without a second collision-based rejection.
+DRVG planning continues to use the inflated robot and padded obstacles.
+Explicit in-place turns, wrapped heading control, and measured-pose replanning
+remain in use. Padding supplies extra planning clearance; it does not establish
+that every additional differential-drive turn fits.
+
+To enable the optional executor checks, set
+`navigation.execution_collision_check: true`. These validate inflated swept
+footprints before execution and at measured poses, including an arc-deviation
+bound between sampled rotation angles.
+
+The GUI/recording obstacle outlines and visible-area shading both use original
+detected obstacles. The display performs an independent scan without building
+another visibility graph. Planner visibility and path selection still use
+`navigation.obstacle_padding_cm`, so the display can show a physical strip of
+free space that the planner excludes as clearance.
+
+The deployment uses `navigation.robot_footprint: circle`. Its centre is the
+wheel axle, explicitly passed as RVG's robot centre at local `(0, 0)`.
+The radius is the maximum axle-to-corner distance of the configured physical
+body, multiplied by `robot_geometry_scale`. With the current dimensions this
+is 6.46 cm (12.91 cm diameter). RVG receives a 72-sided polygon circumscribed
+around that disk, so polygon approximation does not cut into the turning
+envelope. Use `robot_footprint: polygon` to restore the rectangular proxy.
+
+The circle is only a collision envelope. Measured poses and graph states retain
+a full 0–360 degree heading range; dynamic RVG disables geometry-symmetry
+folding, and 0 and 180 degrees remain distinct. Reverse driving retains the
+physical heading. In circle mode the executor omits unnecessary intermediate
+heading alignments but honors the segment endpoint heading.
+
+The current rotation weight is 5.0, with translation weight 1.0 and angles in
+radians: a 90-degree search rotation costs about as much as 7.85 cm of travel.
+Angular distance wraps at 360 degrees (359→1 costs 2 degrees). Search weighting
+does not account for every additional turn needed by the physical executor.
+The circular envelope trades narrow-passage access for space to turn.
+
+The deployment enables `planner.rvg.optimal: true`. This selects DRVG's optimal
+layer-connection construction, not a guarantee of globally optimal navigation
+through an unknown world. The dynamic binding must expose
+`setOptimalRvgConstruction`; after updating the DRVG source, rebuild with:
+
+```bash
+cmake --build ~/drvg/code/build-python --target rvg -j32
+```
 
 Run it from the MicroMVP checkout with the DRVG extension installed or on
 `PYTHONPATH`:
@@ -443,18 +503,193 @@ PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigatio
   --config config/car_v4.yaml
 ```
 
+
+For a rectangular top-down presentation, use the overlay's bird's-eye view:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation_overlay.py \
+  --config config/car_v4.yaml --view birdseye --record recordings/demo-birdseye.mp4
+```
+
+This warps the camera's floor plane into the locked workspace rectangle and
+preserves its physical width-to-height ratio. Goal clicks and planner overlays
+use the same transformation. The recording captures the rectified view.
+`--view perspective` (the default) shows the original camera image. Raised
+objects retain parallax; rectification does not change camera calibration.
+
+For a physically top-down view, mount the camera above the workspace with the
+lens pointing vertically down, and level its mounting platform in both
+directions. A known rectangle on the floor should have parallel opposite edges
+and similar apparent lengths for opposite sides in the original perspective
+view. After moving the camera, restart the demo to estimate a new workspace.
+Recalibrate if the camera or lens focus changes.
+
+To record only the camera view and planner overlays (without the sidebar,
+desktop cursor, or audio), add `--record` to the overlay command:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation_overlay.py \
+  --config config/car_v4.yaml --record recordings/demo.mp4
+```
+
+Recording is armed at startup and starts only when a goal click is accepted.
+It includes the obstacle rescan, planning and movement, then automatically
+finalizes when the goal is reached (including its final heading). Idle time
+before or after a run is excluded. Stop/cancel, planner failure, manual obstacle
+recapture, or closing the window also finalizes the current clip. A temporary
+tracking pause stays in the same clip.
+
+With `--record recordings/demo.mp4`, the first goal uses `demo.mp4`; later
+goals use `demo_002.mp4`, `demo_003.mp4`, and so on. Selecting a new goal
+during a run closes the old clip and starts a new one. Existing numbered files
+are skipped, never overwritten; choose an unused base filename at launch.
+Output uses the displayed camera/rectified resolution at 30 fps independently
+of window size. Encoding runs on a separate thread, and stale frames repeat
+if the GUI stalls. `recordings/` is ignored by Git.
+
 The real-hardware command accepts the same `--mode`, `--strategy`,
 `--scan-mode`, resolution, weight, iteration-limit, quadtree, and
 information-gain options as the simulation command. Its default
 `graph_merge` mode retains the accumulated graph across measured-pose steps.
 
+Each initialized goal run also writes `measured_run_*.csv` and a matching
+metadata JSON in the output directory, automatically. The CSV includes
+timestamps, measured axle x/y, wrapped and unwrapped heading, wheel commands,
+segment/motion targets, and controller state. It is flushed every second and
+closed at completion, cancellation, failure, or exit. Continuous heading
+restarts after tracking loss or an observation gap over 0.5 seconds; use the
+`tracking_epoch` column to distinguish intervals. Commands are requested
+thrust, not motor feedback. The metadata links the prepared route when present.
+
+### Preplan the full route, then execute it
+
+For the fixed-table demo, prepare the entire DRVG route before moving:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation_overlay.py \
+  --config config/car_v4.yaml --view birdseye --execution-mode preplanned \
+  --record recordings/demo-preplanned.mp4
+```
+
+A goal click captures obstacles and starts a background virtual DRVG run,
+advancing between exact planned endpoint poses until a final-goal path is found.
+The car stays stopped while the complete route is prepared. The camera and
+Stop button remain responsive. Preparation must finish successfully before
+any trajectory is executed; `--preplan-timeout 30` limits preparation time.
+
+The saved segments then run with live camera pose feedback and the existing
+turn/forward/reverse controller. There are **no measured-pose DRVG replans**
+during playback. At each segment boundary the car stops, the original-obstacle
+visibility display updates from its measured position, and it pauses for
+`--scan-pause 0.5` seconds before continuing. The GUI labels this as
+**preplanned playback**. A JSON copy of each prepared route is saved in the
+output directory.
+
+Keep the obstacle layout and starting car position fixed during preparation
+and execution. This mode separates planning from tracking; it does not change
+the car's kinematic limits. Stop/cancel, a new goal, or obstacle recapture
+discards the prepared route. Recordings still start at the accepted goal click
+and finish at goal completion or cancellation.
+
+This setup uses a fixed overhead camera, a locked workspace, an obstacle
+snapshot, and live car localization; it is not live SLAM. DRVG's scans are
+software visibility queries against that snapshot. Use
+`--execution-mode live` for the previous measured-pose replanning behavior.
+
+Workspace startup first averages each marker's image corners over
+`workspace.corner_smoothing_frames` (30 by default), then solves marker poses
+from those averaged corners. Any corner more than
+`workspace.corner_motion_tolerance_px` (2 pixels) from its window mean resets
+accumulation; a changed marker set also starts a new window. These estimates
+must then pass the existing 30-frame dimension, origin and tilt stability checks.
+This filtering applies only before workspace lock; live robot tracking continues
+to use current-frame marker observations.
+
+Startup first shows a camera setup window with detected car IDs, the current
+workspace dimensions, and the sample count. Filling the sample window (for
+example, 30/30) is not enough: the estimates must also pass the stability limits.
+If startup times out, the preview stays open. Keep the camera and markers still,
+check focus and calibration, then click **Retry workspace lock**. **Cancel**
+closes the environment. The navigation window opens only after the workspace
+locks and a car is detected. Use `--timeout 30` for a longer initial wait.
+
 The robot remains stopped until you click a goal on the GUI canvas. Enter a
 goal heading before clicking if needed. `Space` or `C` immediately stops the
 robot and cancels the run; `O` stops the robot and replaces the fixed obstacle
 snapshot. Camera tracking loss and any planner failure also produce a stop
-command. By default, per-step planner graphs are written beneath
-`navigation_output/dynamic_rvg/`; pass `--no-planner-drawings` to disable
-them.
+command. Diagnostic graph PNGs are disabled by default for real hardware.
+Use `--planner-drawings` to write them beneath
+`navigation_output/dynamic_rvg/`. This invokes synchronous Matplotlib rendering
+after each plan and can add seconds before the robot moves. Live camera
+overlays and video recording work with PNG output disabled.
+The console reports `planning_ms` (planner plus path adaptation) and, when
+enabled, `diagnostic_plot_ms` separately. Each new goal also captures obstacles
+for `--obstacle-capture-seconds` (default 1 second); segment completion includes
+the configured heading-alignment tolerance and settling time.
+
+---
+
+## Solver geometry inspector
+
+Capture a camera-only snapshot and view RVG's native geometry:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/inspect_drvg.py \
+  --config config/car_v4.yaml --show
+```
+
+It exports `solver.png`, `solver.svg`, `geometry.json`, and `scene.json`
+under a timestamped `diagnostics/drvg/` directory. The four panels show the
+solver environment, the physical/scaled/angular bounding footprints about the
+axle, native legal axle positions, and a close-up at the captured pose.
+The bounds, grown obstacles and shrunken border come from RVG's native
+`Layer` API, and the green/red map samples `Layer.legalConfig()`.
+This is a frozen snapshot, not a live control window, and no serial/motor
+connection is opened.
+
+Replay it at another heading without opening the camera:
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/inspect_drvg.py \
+  --scene diagnostics/drvg/<timestamp>/scene.json --heading 180 --show
+```
+
+The current `workspace.margin_cm: 0.0` uses the full inscribed camera view.
+RVG still shrinks that boundary by its robot bounding footprint when determining
+legal axle positions. Adding a workspace margin would apply another inset.
+
+---
+
+## Camera alignment helper
+
+Run this before the navigation demo to physically aim the camera straight down:
+
+```bash
+python examples/align_camera.py --config config/car_v4.yaml
+```
+
+The helper opens only the camera; it does not connect to the AP or motors and
+does not need the DRVG extension. Keep flat car/obstacle markers in view.
+The arrow and text tell you which way to **tilt the lens**, using directions
+in the live image. Make a small adjustment, then pause for the marker corner
+averaging window to settle. Height and centering are manual; rolling the camera
+around its optical axis does not make it more perpendicular to the floor.
+
+A green screen and **STOP — ALIGNED** appear after 1.5 continuous seconds with:
+
+- floor-normal tilt at most 3 degrees;
+- every projected workspace corner within 3 degrees of a right angle;
+- opposite projected side lengths differing by at most 5 percent.
+
+The helper continues measuring after green. Camera motion, lost/stale frames,
+or an out-of-tolerance estimate clears the green state. These are estimates
+from the configured camera calibration, marker sizes and heights; the tool
+does not recalibrate the camera. Secure the mount when green, press **Esc**,
+and then start the demo so it locks a fresh workspace.
+
+Optional thresholds: `--tilt-tolerance 3 --corner-tolerance 3
+--edge-tolerance 5 --hold-seconds 1.5`. Angles are degrees and edge tolerance
+is a percentage. Use `--help` for details.
 
 ---
 

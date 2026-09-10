@@ -225,3 +225,6 @@ diag_*.csv
 diag_*.png
 keyboard_log.csv
 keyboard_log_plot.png
+recordings/
+
+diagnostics/

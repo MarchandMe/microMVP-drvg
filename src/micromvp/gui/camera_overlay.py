@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QImage, QPainterPath, QPen, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QRectF
+from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsPixmapItem,
@@ -39,7 +40,18 @@ class CameraOverlayCanvas(MVPCanvas):
         image_to_workspace: ImageProjector,
         parent: Optional[QWidget] = None,
         workspace_boundary_height_cm: float = 0.0,
+        birdseye: bool = False,
     ) -> None:
+        self._birdseye = None
+        if birdseye:
+            from .birdseye import BirdseyeProjection
+
+            self._birdseye = BirdseyeProjection(
+                workspace_config.width, workspace_config.height, workspace_to_image,
+            )
+            workspace_to_image = self._birdseye.workspace_to_image
+            image_to_workspace = self._birdseye.image_to_workspace
+            workspace_boundary_height_cm = 0.0
         self._workspace_to_image = workspace_to_image
         self._image_to_workspace = image_to_workspace
         self._workspace_boundary_height_cm = max(
@@ -68,6 +80,10 @@ class CameraOverlayCanvas(MVPCanvas):
         height, width = frame.shape[:2]
         if height <= 0 or width <= 0 or frame.shape[2] != 3:
             return
+
+        if self._birdseye is not None:
+            frame = self._birdseye.warp(frame)
+            height, width = frame.shape[:2]
 
         image = QImage(
             frame.data,
@@ -113,6 +129,27 @@ class CameraOverlayCanvas(MVPCanvas):
         self._camera_item.setScale(self._camera_scale)
         self._update_local_scale_estimate()
 
+    def recording_image(self) -> Optional[QImage]:
+        """Render only the camera rectangle, including retained overlays."""
+        if self._camera_width < 2 or self._camera_height < 2:
+            return None
+        # Even dimensions for video codecs; no sidebar or letterbox margins.
+        image = QImage(
+            self._camera_width // 2 * 2,
+            self._camera_height // 2 * 2,
+            QImage.Format.Format_BGR888,
+        )
+        image.fill(QColor("black"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._scene.render(
+            painter, QRectF(image.rect()),
+            self._camera_item.sceneBoundingRect(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+        )
+        painter.end()
+        return image
+
     def _update_local_scale_estimate(self) -> None:
         """Estimate px/cm for inherited radius and car-size rendering."""
         center_x = self._ws_config.width / 2.0
@@ -151,14 +188,19 @@ class CameraOverlayCanvas(MVPCanvas):
 
     def set_workspace_boundary_height(self, height_cm: float) -> None:
         """Update the boundary projection plane and redraw it immediately."""
-        self._workspace_boundary_height_cm = max(0.0, float(height_cm))
-        self._draw_workspace_boundary()
+        self._workspace_boundary_height_cm = (
+            0.0 if self._birdseye is not None else max(0.0, float(height_cm))
+        )
+        self._redraw_scene()
 
     def _update_drawing_geometry(self, item: Any, drawing: Dict[str, Any]) -> None:
         """Apply optional height to path and filled-region geometry."""
         super()._update_drawing_geometry(item, drawing)
         height_cm = float(drawing.get("projection_height_cm", 0.0))
-        if height_cm == 0.0 or not isinstance(item, QGraphicsPathItem):
+        if not isinstance(item, QGraphicsPathItem):
+            return
+        if height_cm == 0.0:
+            self._clip_region_to_workspace(item, drawing)
             return
 
         drawing_type = drawing.get("type")
@@ -201,6 +243,13 @@ class CameraOverlayCanvas(MVPCanvas):
             else:
                 combined_path = combined_path.united(region_path)
         item.setPath(combined_path)
+        self._clip_region_to_workspace(item, drawing)
+
+    def _clip_region_to_workspace(self, item, drawing) -> None:
+        """Clip after projection so elevated scan geometry cannot spill out."""
+        if (drawing.get("type") == "region" and drawing.get("clip_to_workspace")
+                and isinstance(self._boundary_rect_item, QGraphicsPathItem)):
+            item.setPath(item.path().intersected(self._boundary_rect_item.path()))
 
     def pixel_to_workspace(self, px: float, py: float) -> Point:
         if self._camera_width <= 0 or self._camera_height <= 0:
@@ -286,12 +335,68 @@ class CameraOverlayWindow(MVPWindow):
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
         super().__init__(gui_config, workspace_config, parent)
-        self.setWindowTitle("MicroMVP Camera Overlay")
+        view_name = (
+            "MicroMVP Bird's-eye View"
+            if gui_config.get("camera_view") == "birdseye"
+            else "MicroMVP Camera Overlay"
+        )
+        self._view_name = view_name
+        self._recorder = None
+        recording_path = gui_config.get("recording_path")
+        self._recording_path = Path(recording_path) if recording_path is not None else None
+        self._recording_index = 0
+        self.setWindowTitle(
+            f"{view_name} — recording armed; click a goal"
+            if self._recording_path is not None else view_name
+        )
 
         self._camera_timer = QTimer(self)
         self._camera_timer.timeout.connect(self._consume_latest_frame)
         self._camera_timer.start(33)
         self._environment.set_frame_callback(self._receive_frame)
+
+    def begin_goal_recording(self) -> None:
+        """Start one video for an accepted goal click, closing any previous run."""
+        if self._recording_path is None:
+            return
+        self.end_goal_recording()
+        from .video_recorder import OverlayVideoRecorder
+
+        while True:
+            self._recording_index += 1
+            path = (
+                self._recording_path if self._recording_index == 1 else
+                self._recording_path.with_name(
+                    f"{self._recording_path.stem}_{self._recording_index:03d}"
+                    f"{self._recording_path.suffix}"
+                )
+            )
+            try:
+                self._recorder = OverlayVideoRecorder(path)
+                break
+            except FileExistsError:
+                continue
+            except OSError as error:
+                print(f"[Recording] Cannot start: {error}", flush=True)
+                self.setWindowTitle(f"{self._view_name} — RECORDING FAILED")
+                return
+        self.setWindowTitle(f"{self._view_name} — recording {path}")
+        self._consume_latest_frame()
+
+    def end_goal_recording(self) -> None:
+        """Capture the terminal overlay frame and finalize this run's MP4."""
+        if self._recorder is None:
+            return
+        recorder = self._recorder
+        self._recorder = None
+        image = self._canvas.recording_image()
+        if image is not None:
+            recorder.submit(image)
+        recorder.close()
+        self.setWindowTitle(
+            f"{self._view_name} — saved {recorder.path}; click another goal"
+            if recorder.error is None else f"{self._view_name} — RECORDING FAILED"
+        )
 
     def _create_canvas(self) -> CameraOverlayCanvas:
         canvas_config = self._gui_config.get("canvas", {})
@@ -302,6 +407,7 @@ class CameraOverlayWindow(MVPWindow):
             workspace_boundary_height_cm=float(
                 canvas_config.get("workspace_boundary_height_cm", 0.0)
             ),
+            birdseye=self._gui_config.get("camera_view") == "birdseye",
         )
 
     def set_workspace_boundary_on_floor(self, enabled: bool) -> None:
@@ -326,8 +432,16 @@ class CameraOverlayWindow(MVPWindow):
             self._latest_frame = None
         if frame is not None:
             self._canvas.set_camera_frame(frame)
+        if self._recorder is not None:
+            image = self._canvas.recording_image()
+            if image is not None:
+                self._recorder.submit(image)
+                if self._recorder.error is not None:
+                    print(f"[Recording] Failed: {self._recorder.error}", flush=True)
+                    self.end_goal_recording()
 
     def closeEvent(self, event: Any) -> None:
         self._camera_timer.stop()
         self._environment.set_frame_callback(None)
+        self.end_goal_recording()
         super().closeEvent(event)

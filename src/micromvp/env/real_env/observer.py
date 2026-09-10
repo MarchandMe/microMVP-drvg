@@ -14,7 +14,9 @@ fields rather than defaults.
 
 Workspace lock lifecycle:
     collecting  ->  stable  ->  locked
-Candidates are accumulated for workspace_lock_frames consecutive ready frames.
+Stationary image corners are averaged before the workspace pose solve.
+Image motion or a changed marker set resets this averaging window.
+Candidates are then accumulated for workspace_lock_frames consecutive ready frames.
 Only when the window is full AND all stability thresholds are met does the
 state transition to "locked".
 
@@ -30,7 +32,7 @@ import platform
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
@@ -79,6 +81,8 @@ class ObserverConfig:
 
     # Workspace lock: multi-frame aggregation
     workspace_lock_frames: int = 30
+    workspace_corner_smoothing_frames: int = 30
+    workspace_corner_motion_tolerance_px: float = 2.0
     workspace_width_tolerance_cm: float = 2.0
     workspace_height_tolerance_cm: float = 2.0
     workspace_origin_tolerance_m: float = 0.01
@@ -138,6 +142,12 @@ class ObserverConfig:
             ),
             workspace_min_side_cm=cfg.require("workspace.min_side_cm", float, who=who),
             workspace_lock_frames=cfg.require("workspace.lock_frames", int, who=who),
+            workspace_corner_smoothing_frames=cfg.require(
+                "workspace.corner_smoothing_frames", int, who=who
+            ),
+            workspace_corner_motion_tolerance_px=cfg.require(
+                "workspace.corner_motion_tolerance_px", float, who=who
+            ),
             workspace_width_tolerance_cm=cfg.require(
                 "workspace.tolerance.width_cm", float, who=who
             ),
@@ -211,6 +221,45 @@ class _MarkerInfo:
     tvec: np.ndarray            # (3,) float32
     normal_cam: np.ndarray      # (3,) float32  – marker Z-axis in camera frame
     height_cm: float            # known physical height above ground
+
+
+class _WorkspaceCornerFilter:
+    """Average stationary image corners before the nonlinear pose solve.
+
+    A changed marker set or motion beyond the pixel tolerance restarts the
+    entire window, so old and new views cannot contribute to one lock.
+    """
+
+    def __init__(self, frames: int, motion_tolerance_px: float):
+        self.frames = max(1, frames)
+        if not np.isfinite(motion_tolerance_px) or motion_tolerance_px <= 0:
+            raise ValueError("workspace.corner_motion_tolerance_px must be positive")
+        self.motion_tolerance_px = motion_tolerance_px
+        self.history = {}
+        self.sample_count = 0
+        self.motion_detected = False
+
+    def update(self, corners):
+        self.motion_detected = False
+        if set(corners) != set(self.history):
+            self.history = {key: deque(maxlen=self.frames) for key in corners}
+        for key, points in corners.items():
+            self.history[key].append(np.asarray(points, dtype=np.float64).copy())
+        self.sample_count = min((len(h) for h in self.history.values()), default=0)
+        averaged = {}
+        for key, history in self.history.items():
+            samples = np.stack(history)
+            mean = samples.mean(axis=0)
+            if np.max(np.linalg.norm(samples - mean, axis=2)) > self.motion_tolerance_px:
+                self.history = {
+                    k: deque([np.asarray(v, dtype=np.float64).copy()], maxlen=self.frames)
+                    for k, v in corners.items()
+                }
+                self.sample_count = 1
+                self.motion_detected = True
+                return None
+            averaged[key] = mean
+        return averaged if self.sample_count == self.frames else None
 
 
 class _WorkspaceLockState:
@@ -327,6 +376,10 @@ class ArucoObserver:
         self._workspace = WorkspaceEstimate()
         self._workspace_lock = threading.Lock()
         self._ws_lock_state = _WorkspaceLockState(config.workspace_lock_frames)
+        self._workspace_corner_filter = _WorkspaceCornerFilter(
+            config.workspace_corner_smoothing_frames,
+            config.workspace_corner_motion_tolerance_px,
+        )
 
         self._observations: Dict[int, CarObservation] = {}
         self._obs_lock = threading.Lock()
@@ -495,6 +548,10 @@ class ArucoObserver:
                 timestamp=ws.timestamp,
             )
 
+    def get_workspace_corner_progress(self) -> Tuple[int, int, bool]:
+        corners = self._workspace_corner_filter
+        return corners.sample_count, corners.frames, corners.motion_detected
+
     def get_workspace_lock_state(self) -> str:
         """Return the current workspace lock state: 'collecting', 'stable', or 'locked'."""
         return self._ws_lock_state.state
@@ -620,6 +677,41 @@ class ArucoObserver:
             frame = cv2.undistort(frame, self._K, self._D)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+    def _estimate_workspace_from_markers(
+        self,
+        car_markers: Dict[int, _MarkerInfo],
+        obstacle_markers: Dict[int, _MarkerInfo],
+    ) -> WorkspaceEstimate:
+        """Estimate the current view with corner averaging, without locking it."""
+        markers = {
+            (kind, marker_id): marker
+            for kind, group in (("car", car_markers), ("obstacle", obstacle_markers))
+            for marker_id, marker in group.items()
+        }
+        averaged = self._workspace_corner_filter.update(
+            {key: marker.image_corners for key, marker in markers.items()}
+        )
+        stable_markers = []
+        if averaged is not None:
+            for key, corners in averaged.items():
+                size_mm = (
+                    self._config.car_marker_size_mm
+                    if key[0] == "car" else self._config.obstacle_marker_size_mm
+                )
+                ok, rvec, tvec = cv2.solvePnP(
+                    self._marker_corners_in_marker_frame(size_mm / 1000.0),
+                    corners, self._K, self._D, flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
+                if not ok:
+                    stable_markers = []
+                    break
+                stable_markers.append(replace(
+                    markers[key], image_corners=corners,
+                    rvec=rvec.reshape(3), tvec=tvec.reshape(3),
+                    normal_cam=cv2.Rodrigues(rvec)[0][:, 2],
+                ))
+        return self._estimate_workspace(stable_markers)
+
     def _try_lock_workspace(
         self,
         car_markers: Dict[int, _MarkerInfo],
@@ -630,8 +722,7 @@ class ArucoObserver:
             if self._ws_lock_state.is_locked:
                 return self._workspace
 
-        all_markers = list(car_markers.values()) + list(obstacle_markers.values())
-        candidate = self._estimate_workspace(all_markers)
+        candidate = self._estimate_workspace_from_markers(car_markers, obstacle_markers)
 
         self._ws_lock_state.add_candidate(candidate)
 
@@ -651,8 +742,7 @@ class ArucoObserver:
                 self._ws_lock_state.state = "collecting"
 
         with self._workspace_lock:
-            if candidate.ready:
-                self._workspace = candidate
+            self._workspace = candidate
             return self._workspace
 
     def _update_observations(
@@ -673,6 +763,8 @@ class ArucoObserver:
         else:
             with self._obs_lock:
                 self._observations = {}
+            with self._car_ids_lock:
+                self._known_car_ids.clear()
         return car_obs
 
     def _apply_outlier_filter(

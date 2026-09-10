@@ -400,11 +400,13 @@ class DynamicRVGSettings:
     bucket_capacity: int = 32
     information_weight: float = 1.0
     robot_geometry_scale: float = 1.2
+    robot_footprint: str = "polygon"
+    optimal: bool = False
 
 
 @dataclass(slots=True)
 class DynamicRVGPlan:
-    """One planner segment and its controller-ready projection."""
+    """One planner segment with SE(2) configurations and its XY display polyline."""
 
     status: Any
     configurations: list[Any]
@@ -414,7 +416,7 @@ class DynamicRVGPlan:
 
     @property
     def has_path(self) -> bool:
-        return len(self.configurations) > 1 and len(self.controller_path) > 1
+        return len(self.configurations) > 1
 
 
 class DynamicRVGSession:
@@ -434,16 +436,17 @@ class DynamicRVGSession:
         self._rvg = importlib.import_module("rvg")
         self._workspace = workspace
         self._settings = settings
-        self._heading_marker_length = max(
-            workspace.car_width, workspace.car_height
-        ) * 0.25
 
-        geometry = [
-            (float(x), float(y))
-            for x, y in (
-                robot_geometry or self.default_robot_geometry(workspace)
-            )
-        ]
+        self._circle_radius = None
+        if settings.robot_footprint == "circle":
+            body = robot_geometry or self.physical_robot_geometry(workspace)
+            self._circle_radius = max(math.hypot(x, y) for x, y in body)
+            geometry = self.circular_robot_geometry(body)
+        elif settings.robot_footprint == "polygon":
+            geometry = list(robot_geometry or self.default_robot_geometry(workspace))
+        else:
+            raise ValueError("robot_footprint must be 'polygon' or 'circle'")
+        geometry = [(float(x), float(y)) for x, y in geometry]
         self._base_robot_geometry = list(geometry)
         geometry = [
             (
@@ -499,6 +502,11 @@ class DynamicRVGSession:
                 f"obstacle polygons into {len(world_obstacles)}"
             )
 
+        # Retain the exact native inputs for solver-geometry inspection.
+        self._native_robot = robot
+        self._native_border = border
+        self._native_obstacles = world_obstacles
+
         self._planner = self._rvg.PyDynamicRVG(
             robot=robot,
             border=border,
@@ -506,6 +514,12 @@ class DynamicRVGSession:
             resolution=settings.resolution,
             numThreads=settings.num_threads,
         )
+        if settings.optimal:
+            setter = getattr(self._planner, "setOptimalRvgConstruction", None)
+            if setter is None or not setter(True):
+                raise RuntimeError(
+                    "DRVG optimal mode requires updated Python bindings; rebuild ~/drvg/code/build-python"
+                )
         self._planner.setWeight(
             settings.euclidean_weight, settings.rotational_weight
         )
@@ -566,6 +580,65 @@ class DynamicRVGSession:
         return values[mode]
 
     @staticmethod
+    def physical_robot_geometry(workspace: WorkspaceConfig) -> list[Point]:
+        left = workspace.offset_w
+        right = workspace.car_width - workspace.offset_w
+        rear = workspace.offset_h
+        front = workspace.car_height - workspace.offset_h
+        return [(-rear, left), (-rear, -right), (front, -right), (front, left)]
+
+    @staticmethod
+    def circular_robot_geometry(body: PolygonPoints, sides: int = 72) -> list[Point]:
+        """Circumscribe the body's full rotation disk, never inscribe it."""
+        radius = max(math.hypot(x, y) for x, y in body)
+        if not math.isfinite(radius) or radius <= 0 or sides < 8:
+            raise ValueError("Invalid circular footprint")
+        vertex_radius = radius / math.cos(math.pi / sides)
+        return [(vertex_radius * math.cos(2 * math.pi * i / sides),
+                 vertex_radius * math.sin(2 * math.pi * i / sides))
+                for i in range(sides)]
+
+    @property
+    def planning_circle_radius(self) -> float | None:
+        if self._circle_radius is None:
+            return None
+        return self._circle_radius * self._settings.robot_geometry_scale
+
+    def _circle_sweep_is_valid(self, start: Point, end: Point, radius: float) -> bool:
+        """Exact disk/capsule check against polygon edges and workspace bounds."""
+        if any(x - radius < -_GEOMETRY_EPSILON
+               or x + radius > self._workspace.width + _GEOMETRY_EPSILON
+               or y - radius < -_GEOMETRY_EPSILON
+               or y + radius > self._workspace.height + _GEOMETRY_EPSILON
+               for x, y in (start, end)):
+            return False
+
+        def point_segment_distance(point, a, b):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length_squared = dx * dx + dy * dy
+            if length_squared == 0:
+                return math.dist(point, a)
+            t = max(0.0, min(1.0, ((point[0]-a[0])*dx + (point[1]-a[1])*dy) / length_squared))
+            return math.hypot(point[0] - a[0] - t*dx, point[1] - a[1] - t*dy)
+
+        for obstacle in self._obstacle_points:
+            if _point_in_polygon(start, obstacle) or _point_in_polygon(end, obstacle):
+                return False
+            for index, a in enumerate(obstacle):
+                b = obstacle[(index + 1) % len(obstacle)]
+                if _segments_intersect(start, end, a, b):
+                    return False
+                distance = min(
+                    point_segment_distance(start, a, b),
+                    point_segment_distance(end, a, b),
+                    point_segment_distance(a, start, end),
+                    point_segment_distance(b, start, end),
+                )
+                if distance < radius - _GEOMETRY_EPSILON:
+                    return False
+        return True
+
+    @staticmethod
     def default_robot_geometry(workspace: WorkspaceConfig) -> list[Point]:
         """Return the same axle-centred footprint used by NavigationCoordinator."""
         left_extent = workspace.offset_w
@@ -609,6 +682,9 @@ class DynamicRVGSession:
         ):
             return False
 
+        if self._settings.robot_footprint == "circle":
+            return self._circle_sweep_is_valid((x, y), (x, y), self._circle_radius * scale)
+
         cosine = math.cos(math.radians(theta_degrees))
         sine = math.sin(math.radians(theta_degrees))
         footprint = [
@@ -631,25 +707,66 @@ class DynamicRVGSession:
             for obstacle in self._obstacle_points
         )
 
+    def motion_is_valid(self, start: Pose, end: Pose) -> bool:
+        """Conservatively cover translation plus shortest rotation with sweeps.
+
+        Each <=5 degree interval uses the convex hull of its endpoint
+        footprints, expanded by R*(1-cos(angle/2)) to cover circular arcs.
+        The supplied obstacles already include deployment padding.
+        """
+        if not all(math.isfinite(value) for value in (*start, *end)):
+            return False
+        scale = self._settings.robot_geometry_scale
+        if self._settings.robot_footprint == "circle":
+            return self._circle_sweep_is_valid(start[:2], end[:2], self._circle_radius * scale)
+        delta = (end[2] - start[2] + 180.0) % 360.0 - 180.0
+        steps = max(1, math.ceil(abs(delta) / 5.0))
+        radius = max(math.hypot(x, y) for x, y in self._base_robot_geometry) * scale
+        arc_padding = radius * (1.0 - math.cos(math.radians(abs(delta) / steps) / 2.0))
+
+        def footprint(fraction):
+            x = start[0] + fraction * (end[0] - start[0])
+            y = start[1] + fraction * (end[1] - start[1])
+            theta = math.radians(start[2] + fraction * delta)
+            c, sn = math.cos(theta), math.sin(theta)
+            return [(x + scale * (px * c - py * sn),
+                     y + scale * (px * sn + py * c))
+                    for px, py in self._base_robot_geometry]
+
+        previous = footprint(0)
+        for step in range(1, steps + 1):
+            current = footprint(step / steps)
+            points = sorted(set(previous + current))
+            lower = []
+            for point in points:
+                while len(lower) >= 2 and _cross_product(lower[-2], lower[-1], point) <= 0:
+                    lower.pop()
+                lower.append(point)
+            upper = []
+            for point in reversed(points):
+                while len(upper) >= 2 and _cross_product(upper[-2], upper[-1], point) <= 0:
+                    upper.pop()
+                upper.append(point)
+            swept = lower[:-1] + upper[:-1]
+            if arc_padding > 0:
+                swept = pad_obstacle_polygon(swept, arc_padding)
+            if any(x <= 0 or x >= self._workspace.width or y <= 0 or y >= self._workspace.height
+                   for x, y in swept):
+                return False
+            if any(_polygons_intersect(swept, obstacle) for obstacle in self._obstacle_points):
+                return False
+            previous = current
+        return True
+
     def _rotation_is_valid(
         self,
         position: Point,
         start_heading: float,
         end_heading: float,
     ) -> bool:
-        """Check an in-place rotation at five-degree intervals."""
-        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
-        steps = max(1, math.ceil(abs(delta) / 5.0))
-        return all(
-            self.pose_is_valid(
-                (
-                    position[0],
-                    position[1],
-                    start_heading + delta * index / steps,
-                ),
-                robot_geometry_scale=self._settings.robot_geometry_scale,
-            )
-            for index in range(steps + 1)
+        """Check the full shortest rotation sweep with the inflated footprint."""
+        return self.motion_is_valid(
+            (*position, start_heading), (*position, end_heading)
         )
 
     def _direct_goal_path_is_valid(self) -> bool:
@@ -771,116 +888,62 @@ class DynamicRVGSession:
         return [(vertex.getX(), vertex.getY()) for vertex in polygon.getVertices()]
 
     def _collapse_redundant_full_turns(
-        self,
-        configurations: Sequence[Any],
+        self, configurations: Sequence[Any]
     ) -> list[Any]:
-        """Remove same-position RVG rotations that take the long way around.
-
-        RVG's graph cost currently uses the absolute difference between two
-        angles. Around the 0/2pi seam that can select, for example,
-        1, 5, 15, ..., 355 degrees instead of the equivalent -6-degree turn.
-        Only collapse such a run when the short in-place rotation is valid for
-        the full scaled footprint; a deliberately long collision-avoiding
-        rotation must remain intact.
-        """
-        collapsed: list[Any] = []
+        """Coalesce same-position turns only when the full shortest sweep is clear."""
+        collapsed = []
         index = 0
         while index < len(configurations):
-            run_end = index
+            end = index
             start = configurations[index]
-            while run_end + 1 < len(configurations):
-                candidate = configurations[run_end + 1]
-                if (
-                    abs(candidate.getX() - start.getX()) > 1e-6
-                    or abs(candidate.getY() - start.getY()) > 1e-6
-                ):
+            while end + 1 < len(configurations):
+                candidate = configurations[end + 1]
+                if math.hypot(candidate.getX() - start.getX(),
+                              candidate.getY() - start.getY()) > 1e-6:
                     break
-                run_end += 1
-
-            run = list(configurations[index : run_end + 1])
-            if len(run) >= 3:
-                wrapped_travel = sum(
-                    abs(
-                        math.atan2(
-                            math.sin(
-                                run[offset].getTheta()
-                                - run[offset - 1].getTheta()
-                            ),
-                            math.cos(
-                                run[offset].getTheta()
-                                - run[offset - 1].getTheta()
-                            ),
-                        )
-                    )
-                    for offset in range(1, len(run))
-                )
-                shortest_delta = math.atan2(
-                    math.sin(run[-1].getTheta() - run[0].getTheta()),
-                    math.cos(run[-1].getTheta() - run[0].getTheta()),
-                )
-                redundant_revolution = (
-                    wrapped_travel - abs(shortest_delta) > math.pi
-                )
-                if redundant_revolution:
-                    short_rotation_valid = self._rotation_is_valid(
-                        (start.getX(), start.getY()),
-                        math.degrees(run[0].getTheta()),
-                        math.degrees(run[-1].getTheta()),
-                    )
-                    if short_rotation_valid:
-                        run = [run[0], run[-1]]
-
+                end += 1
+            run = list(configurations[index:end + 1])
+            if len(run) >= 3 and self._rotation_is_valid(
+                (start.getX(), start.getY()),
+                math.degrees(run[0].getTheta()),
+                math.degrees(run[-1].getTheta()),
+            ):
+                run = [run[0], run[-1]]
             collapsed.extend(run)
-            index = run_end + 1
+            index = end + 1
         return collapsed
 
     def _to_controller_path(self, configurations: Sequence[Any]) -> list[Point]:
-        """Project an SE(2) RVG path to NavigationController waypoints."""
-        path: list[Point] = []
-        previous_xy: Point | None = None
-        previous_theta: float | None = None
-
-        for index, configuration in enumerate(configurations):
+        """Return the actual XY polyline, without synthetic turn waypoints."""
+        path = []
+        for configuration in configurations:
             xy = (configuration.getX(), configuration.getY())
-            theta = configuration.getTheta()
-
-            if previous_xy is None:
+            if not path or math.dist(path[-1], xy) > 1e-6:
                 path.append(xy)
-                previous_xy = xy
-                previous_theta = theta
-                continue
-
-            same_xy = (
-                abs(xy[0] - previous_xy[0]) <= 1e-6
-                and abs(xy[1] - previous_xy[1]) <= 1e-6
-            )
-            if same_xy:
-                reference_theta = (
-                    previous_theta if previous_theta is not None else 0.0
-                )
-                delta_theta = (
-                    theta - reference_theta + math.pi
-                ) % (2.0 * math.pi) - math.pi
-                terminal_rotation = index == len(configurations) - 1
-                if abs(delta_theta) > math.radians(1.0) and not terminal_rotation:
-                    marker = (
-                        xy[0] + self._heading_marker_length * math.cos(theta),
-                        xy[1] + self._heading_marker_length * math.sin(theta),
-                    )
-                    if (
-                        abs(marker[0] - path[-1][0]) > 1e-6
-                        or abs(marker[1] - path[-1][1]) > 1e-6
-                    ):
-                        path.append(marker)
-                previous_theta = theta
-                continue
-
-            if (
-                abs(xy[0] - path[-1][0]) > 1e-6
-                or abs(xy[1] - path[-1][1]) > 1e-6
-            ):
-                path.append(xy)
-            previous_xy = xy
-            previous_theta = theta
-
         return path
+
+
+class PhysicalVisibility:
+    """Display visibility from original obstacles, without graph construction.
+
+    Reuse the binding's scan-only API. Reinitializing before each scan clears
+    pending observations so this display-only sensor retains no planner state.
+    """
+
+    def __init__(self, workspace, obstacles, scan_mode="center"):
+        physical_robot = DynamicRVGSession.physical_robot_geometry(workspace)
+        self._session = DynamicRVGSession(
+            workspace, obstacles,
+            DynamicRVGSettings(scan_mode=scan_mode, robot_geometry_scale=1.0),
+            robot_geometry=physical_robot,
+        )
+
+    def scan(self, pose):
+        self._session.initialize(pose, pose)
+        observation = self._session.scan()
+        if not observation.success:
+            return [], []
+        return (
+            self._session._polygon_points(observation.outerBoundary),
+            [self._session._polygon_points(hole) for hole in observation.holes],
+        )

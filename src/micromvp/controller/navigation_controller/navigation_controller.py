@@ -180,6 +180,7 @@ class NavigationController(Controller):
         self._min_turn_factor = 0.25
 
         # Path state
+        self._reverse_path = False
         self._path_raw: List[Point] = []
         self._path: List[Point] = []
         self._path_s: List[float] = []   # prefix arc-length
@@ -302,7 +303,10 @@ class NavigationController(Controller):
     # Public API
     # ---------------------------
 
-    def set_path(self, path: List[Point]) -> None:
+    def set_path(self, path: List[Point], *, reverse: bool = False) -> None:
+        self._reverse_path = bool(reverse)
+        self._align_active = False
+        self._car_state.metadata["reverse"] = self._reverse_path
         # cancel rotation if any
         self._target_theta = None
         self._rotation_stable_start = None
@@ -336,6 +340,8 @@ class NavigationController(Controller):
         self._car_state.metadata.pop("target_point", None)
 
     def clear_path(self) -> None:
+        self._reverse_path = False
+        self._car_state.metadata.pop("reverse", None)
         self._path_raw = []
         self._path = []
         self._path_s = []
@@ -354,6 +360,8 @@ class NavigationController(Controller):
         self._car_state.metadata.pop("target_point", None)
 
     def rotate_to(self, target_theta: float, on_done: Optional[callable] = None) -> None:
+        self._reverse_path = False
+        self._car_state.metadata.pop("reverse", None)
         # Normalize [0, 360)
         self._target_theta = target_theta % 360.0
         self._rotation_stable_start = None
@@ -452,7 +460,12 @@ class NavigationController(Controller):
             return self._calculate_rotation_action()
 
         if self._nav_state == NavigationState.FOLLOWING:
-            return self._calculate_path_action()
+            action = self._calculate_path_action()
+            if self._reverse_path:
+                # Virtual forward motion at theta+180 has the same angular
+                # velocity but opposite linear velocity: swap AND negate.
+                return Action(left_speed=-action.right_speed, right_speed=-action.left_speed)
+            return action
 
         return Action.stop()
 
@@ -468,13 +481,20 @@ class NavigationController(Controller):
             self._car_state.metadata.pop("rotation_error_deg", None)
             return Action.stop()
 
-        current_theta = self._car_state.theta
+        # Rotation braking must use the latest camera heading: the path
+        # follower's EMA lags during a turn and can keep driving past the target.
+        current_theta = self._car_state.metadata.get("measured_theta", self._car_state.theta)
         error = math.degrees(
             _wrap_to_pi(math.radians(self._target_theta - current_theta))
         )
         self._car_state.metadata["rotation_error_deg"] = error
 
         if abs(error) <= self.ROTATION_TOLERANCE_DEG:
+            # Seed the following path with the stopped physical heading, not
+            # a stale filtered angle that would immediately request another turn.
+            self._filtered_theta = current_theta
+            self._car_state.theta = current_theta
+            self._car_state.metadata["filtered_theta"] = current_theta
             now = time.time()
 
             if self._rotation_stable_start is None:
@@ -554,7 +574,7 @@ class NavigationController(Controller):
 
         robot_x = self._car_state.x
         robot_y = self._car_state.y
-        robot_theta = self._car_state.theta  # degrees
+        robot_theta = (self._car_state.theta + (180.0 if self._reverse_path else 0.0)) % 360.0
 
         self.car_size = max(self._ws_config.car_width, self._ws_config.car_height)
         wheel_base = self._ws_config.wheel_base
@@ -858,6 +878,9 @@ class NavigationController(Controller):
 
     def reset(self) -> None:
         super().reset()
+        self._reverse_path = False
+        self._align_active = False
+        self._car_state.metadata.pop("reverse", None)
 
         self._path_raw = []
         self._path = []

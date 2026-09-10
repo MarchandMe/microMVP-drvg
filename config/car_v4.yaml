@@ -127,8 +127,9 @@ camera:
 # the workspace. Origin is its bottom-left corner, +X right, +Y up.
 # -----------------------------------------------------------------------------
 workspace:
-  # Shrink each side by this much, to keep robots off the very edge of view.
-  margin_cm: 3
+  # Use the full inscribed camera view. RVG already reserves the robot's
+  # bounding footprint inside this boundary when computing legal axle poses.
+  margin_cm: 0.0
 
   # Scale the detected workspace rectangle about its centre after applying
   # margin_cm. 0.95 insets each edge by 2.5% of the detected dimension.
@@ -142,6 +143,12 @@ workspace:
   # it is locked. Once locked it never changes, so all coordinates stay
   # comparable for the rest of the session.
   lock_frames: 30
+
+  # Average detected marker corners before solving startup floor-plane poses.
+  # A changed marker set or a corner >2 pixels from its window mean restarts
+  # accumulation. This does not smooth live robot tracking after workspace lock.
+  corner_smoothing_frames: 30
+  corner_motion_tolerance_px: 2.0
 
   # How much the estimate may wander across that window and still count as
   # steady. Loosen these if the workspace never locks; tighten them if it
@@ -230,14 +237,11 @@ control:
     tolerance_deg: 4.0
     stable_time_sec: 0.2
 
-    # Rotation thrust range. Below 15 degrees of error the controller holds
-    # speed_min until it reaches tolerance_deg, so speed_min sets how far it
-    # overshoots: at 0.15 the car turns 1.36 deg per control cycle, which
-    # exceeds tolerance_deg after two cycles of sensing and actuation delay
-    # and leaves it hunting around the target. Lower is steadier, until it
-    # is too low to break static friction and the car stalls short.
-    speed_max: 0.25
-    speed_min: 0.10
+    # Lower thrust for controlled turns. Below 15 degrees of remaining
+    # error, use speed_min for the final approach to the target heading.
+    # Live tests: 0.08 and 0.10 stalled; 0.12 produced a controlled turn.
+    speed_max: 0.15
+    speed_min: 0.12
 
 # -----------------------------------------------------------------------------
 # Navigation coordinator
@@ -251,12 +255,20 @@ navigation:
   active_robot_id: null
 
   # The planner treats the robot as this much larger than it is, so planned
-  # paths keep clear of obstacles. 1.0 plans against the true footprint.
+  # paths keep clear of obstacles. 1.0 uses the selected footprint's base size.
   robot_geometry_scale: 1.3
+
+  # Circle encloses the complete physical body rotation about the wheel axle.
+  # Polygon retains the orientation-dependent rectangular planning footprint.
+  robot_footprint: polygon
 
   # Expand every detected obstacle polygon outward by this distance before
   # planning. This is independent of robot_geometry_scale.
-  obstacle_padding_cm: 0.0
+  obstacle_padding_cm: 1.0
+
+  # Optional extra rejection by the turn/drive executor. Planning still uses
+  # the inflated robot and padded obstacles when this is false.
+  execution_collision_check: false
 
 # -----------------------------------------------------------------------------
 # Path planning
@@ -275,6 +287,10 @@ planner:
     # slower; 36 gives 10-degree steps.
     resolution: 36
 
+    # Propagate all eligible layer connections in DRVG graph construction.
+    optimal: true
+
     # Relative cost of translating versus rotating.
     euclidean_weight: 1.0
-    rotational_weight: 0.1
+    # At weight 5, a 90-degree heading change costs about 7.85 cm of travel.
+    rotational_weight: 5.0

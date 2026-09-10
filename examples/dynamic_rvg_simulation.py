@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as PolygonPatch
 
 from micromvp.controller import NavigationController
+from micromvp.controller.navigation_controller.pose_path_executor import PosePathExecutor
 from micromvp.core.models import Action, CarState, Pose
 from micromvp.env import SimConfig, SimEnv
 from micromvp.planner import (
@@ -69,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=36,
         help="DynamicRVG angular resolution (default: 36)",
+    )
+    parser.add_argument(
+        "--execution-collision-check", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optional executor rejection; disabled like the hardware demo",
+    )
+    parser.add_argument(
+        "--robot-footprint", choices=("polygon", "circle"), default="polygon",
+        help="Planning footprint; circle covers the full physical turning envelope",
     )
     parser.add_argument(
         "--num-threads",
@@ -186,7 +196,7 @@ class DynamicRVGSimulation:
             self.workspace,
             lookahead_distance=2.4,
             max_speed=0.45,
-            goal_tolerance=1.0,
+            goal_tolerance=0.5,  # Match the real demo's endpoint tolerance.
             max_point_gap_ratio=0.05,
             no_skip_ratio=0.75,
         )
@@ -206,7 +216,13 @@ class DynamicRVGSimulation:
                 bucket_capacity=max(1, args.bucket_capacity),
                 information_weight=max(0.0, args.information_weight),
                 robot_geometry_scale=1.2,
+                robot_footprint=args.robot_footprint,
             ),
+        )
+        self.executor = PosePathExecutor(
+            self.controller, self.planner.motion_is_valid,
+            reject_blocked_motion=args.execution_collision_check,
+            orientation_invariant=args.robot_footprint == "circle",
         )
         self._lock = threading.RLock()
         self.goal = GOAL
@@ -241,6 +257,7 @@ class DynamicRVGSimulation:
             self.environment.set_pose(ROBOT_ID, *start)
         self.environment.reset_time()
         self.controller.reset()
+        self.executor.reset()
         observation = self.environment.observe()[ROBOT_ID]
         self.start_pose = observation.pose
         self.goal = goal
@@ -298,38 +315,28 @@ class DynamicRVGSimulation:
                     self.controller.update(observation)
                     return
 
-            action = self.controller.step(observation)
+            try:
+                action = self.executor.step(observation)
+            except ValueError as error:
+                self.failed = True
+                self.status_message = f"Motion blocked: {error}"
+                self.environment.apply_actions({ROBOT_ID: Action.stop()})
+                return
             self.environment.apply_actions({ROBOT_ID: action})
             self.trajectory.append((observation.x, observation.y))
-
-            if self.controller.car_state.status_label == "FINISHED":
+            self.status_message = self.executor.status
+            if self.executor.done:
                 self.environment.apply_actions({ROBOT_ID: Action.stop()})
                 if self.final_segment_active:
-                    self.controller.rotate_to(self.goal[2])
-                    self.final_segment_active = False
-                    self.final_rotation_active = True
-                    self.status_message = "Performing final heading rotation"
+                    distance, heading_error = self.goal_errors(observation.pose)
+                    self.finished = True
+                    self.status_message = f"Goal reached: {distance:.3f} cm, {heading_error:.3f} deg"
                 elif self.planner.complete_current_segment():
                     self.needs_plan = True
                     self.status_message = "Temporary segment complete; replanning"
                 else:
                     self.failed = True
-                    self.status_message = (
-                        "Controller completed a segment but DRVG had no pending "
-                        "temporary goal"
-                    )
-
-            if (
-                self.final_rotation_active
-                and self.controller.car_state.status_label == "ROTATION_DONE"
-            ):
-                self.environment.apply_actions({ROBOT_ID: Action.stop()})
-                distance, heading_error = self.goal_errors(observation.pose)
-                self.finished = True
-                self.status_message = (
-                    f"Goal reached: {distance:.3f} cm, "
-                    f"{heading_error:.3f} deg"
-                )
+                    self.status_message = "No pending temporary goal to complete"
 
     def _plan_next_segment(self) -> None:
         plan = self.planner.step()
@@ -354,7 +361,13 @@ class DynamicRVGSimulation:
                 self.args.output_dir
                 / f"planner_step_{self.planning_step:02d}.png"
             )
-        self.controller.set_path(plan.controller_path)
+        try:
+            self.executor.load(plan.configurations)
+        except ValueError as error:
+            self.failed = True
+            self.status_message = f"Motion blocked: {error}"
+            self.environment.apply_actions({ROBOT_ID: Action.stop()})
+            return
         self.final_segment_active = plan.final_segment
         self.needs_plan = False
         self.status_message = (

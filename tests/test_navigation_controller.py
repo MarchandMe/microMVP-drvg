@@ -150,3 +150,24 @@ def test_rotation_across_zero_respects_tolerance(
     assert action.right_speed == 0.0
     assert controller.car_state.status_label == "ROTATION_STABLE"
     assert controller.car_state.metadata["rotation_error_deg"] == pytest.approx(1.0)
+
+
+def test_rotation_stops_at_measured_heading_without_waiting_for_ema(workspace):
+    controller = NavigationController(1,workspace,heading_filter_alpha=.1)
+    controller.update(RobotObservation(1,20,20,0,timestamp=1))
+    controller.rotate_to(20)
+    action = controller.step(RobotObservation(1,20,20,20,timestamp=1.033))
+    assert action.left_speed == 0 and action.right_speed == 0
+    assert controller.car_state.status_label == "ROTATION_STABLE"
+    assert controller.car_state.theta == pytest.approx(20)
+    assert controller.car_state.metadata["rotation_error_deg"] == pytest.approx(0)
+
+
+def test_stale_filtered_heading_cannot_hide_rotation_overshoot(workspace):
+    controller = NavigationController(1,workspace,heading_filter_alpha=.1)
+    controller.update(RobotObservation(1,20,20,0,timestamp=1))
+    controller.rotate_to(0)
+    action = controller.step(RobotObservation(1,20,20,10,timestamp=1.033))
+    assert controller.car_state.status_label == "ROTATING"
+    assert controller.car_state.metadata["rotation_error_deg"] == pytest.approx(-10)
+    assert action.left_speed > 0 and action.right_speed < 0

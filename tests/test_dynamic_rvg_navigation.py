@@ -49,11 +49,14 @@ class _RecordingPlanner:
         self.events.append(("step", None))
         return DynamicRVGPlan(
             status="TemporaryGoalPathAvailable",
-            configurations=[object(), object()],
+            configurations=[_Configuration(10, 10, 0), _Configuration(20, 15, 0)],
             controller_path=[(10.0, 10.0), (20.0, 15.0)],
             temporary_goal=(20.0, 15.0),
             final_segment=False,
         )
+
+    def motion_is_valid(self, start, end) -> bool:
+        return True
 
     def draw(self, _figure_path: Path) -> bool:
         return True
@@ -85,6 +88,9 @@ class _RecordingController:
     def step(self, _observation: RobotObservation) -> Action:
         return Action.stop()
 
+    def rotate_to(self, heading) -> None:
+        self.car_state.status_label = 'ROTATING'
+
     def set_speed(self, _speed: float) -> None:
         pass
 
@@ -103,6 +109,16 @@ class _Configuration:
 
     def getTheta(self) -> float:
         return self._theta
+
+
+@pytest.fixture(autouse=True)
+def display_scan_without_native_binding(monkeypatch):
+    class DisplayScan:
+        def scan(self, pose):
+            return _RecordingPlanner().latest_visible_region()
+    monkeypatch.setattr(
+        DynamicRVGRealNavigator, "_new_display_visibility", lambda self: DisplayScan()
+    )
 
 
 def test_obstacle_capture_default_is_one_second(monkeypatch) -> None:
@@ -168,6 +184,7 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
         ("initialize", (observation.pose, (40.0, 20.0, 0.0))),
         ("step", None),
     ]
+    assert not navigator.executor.reject_blocked_motion
     assert navigator.planning_step == 1
     assert navigator.needs_plan is False
     scanned_area = next(
@@ -176,6 +193,7 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
         if drawing["uuid"] == "scanned_area"
     )
     assert scanned_area["type"] == "region"
+    assert scanned_area["clip_to_workspace"] is True
     assert len(scanned_area["regions"]) == 1
     assert scanned_area["projection_height_cm"] == 4.0
     obstacle_drawing = next(
@@ -184,6 +202,9 @@ def test_first_plan_uses_initialization_observation(monkeypatch, tmp_path) -> No
         if drawing["uuid"] == "fixed_obstacle_0"
     )
     assert obstacle_drawing["projection_height_cm"] == 4.0
+    assert obstacle_drawing["points"] == [
+        (5.0, 5.0), (7.0, 5.0), (7.0, 7.0), (5.0, 7.0), (5.0, 5.0)
+    ]
 
     navigator.set_overlay_projection_to_floor(True)
     floor_drawings = navigator._gui_drawings()
@@ -367,6 +388,7 @@ def test_rejected_obstacle_replacement_keeps_previous_world(
         obstacle_padding_cm=0.5,
     )
     previous_obstacles = navigator.fixed_obstacles
+    previous_display = navigator._display_obstacles
 
     with pytest.raises(RuntimeError, match="invalid geometry"):
         navigator.replace_obstacles(
@@ -375,9 +397,10 @@ def test_rejected_obstacle_replacement_keeps_previous_world(
 
     assert navigator.planner is initial_planner
     assert navigator.fixed_obstacles == previous_obstacles
+    assert navigator._display_obstacles == previous_display
 
 
-def test_replanning_uses_terminal_pose_after_actual_size_validation(
+def test_replanning_uses_measured_pose_without_discarding_padding(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -449,15 +472,112 @@ def test_replanning_uses_terminal_pose_after_actual_size_validation(
     navigator._finish_current_segment(observation.pose)
 
     assert navigator.needs_plan
-    assert navigator._replan_pose_override == pytest.approx(
-        (20.0, 15.0, 90.0)
-    )
 
     planner.events.clear()
     navigator.process_observation(observation)
 
     assert planner.events[0] == (
         "update_pose",
-        pytest.approx((20.0, 15.0, 90.0)),
+        pytest.approx(observation.pose),
     )
     assert planner.events[1] == ("step", None)
+
+
+def test_recording_state_includes_pending_goal_and_stops_on_completion_or_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(DynamicRVGRealNavigator, "_new_planner", lambda self: _RecordingPlanner())
+    navigator = DynamicRVGRealNavigator(
+        WorkspaceConfig(50, 30, 4.2, 4.8, 2.1, 4.5, 4.2, 10, 30, [3]),
+        _RecordingController(), [], DynamicRVGSettings(), tmp_path,
+    )
+    assert not navigator.recording_run_active()
+    assert not navigator.request_goal(-1, 20)
+    assert not navigator.recording_run_active()
+    assert navigator.request_goal(40, 20)
+    assert navigator.recording_run_active()  # Includes the obstacle rescan.
+    navigator.report_tracking_lost()
+    assert navigator.recording_run_active()  # A temporary pause does not end the run.
+    navigator.report_obstacle_capture_failed(RuntimeError("bad scan"))
+    assert not navigator.recording_run_active()
+    navigator.request_goal(40, 20)
+    navigator.cancel()
+    assert not navigator.recording_run_active()
+    navigator.request_goal(40, 20)
+    navigator._finish_goal((40, 20, 0))
+    assert not navigator.recording_run_active()
+
+
+def test_preplanned_playback_never_replans_from_measured_drift(monkeypatch,tmp_path):
+    from micromvp.planner.preplanned import FrozenConfiguration as V
+    plans=[
+        DynamicRVGPlan("TemporaryGoalPathAvailable",[V(10,10,0),V(20,10,0)],[(10,10),(20,10)],(20,10),False),
+        DynamicRVGPlan("GoalPathAvailable",[V(20,10,0),V(30,10,0)],[(20,10),(30,10)],None,True),
+    ]
+    class Task:
+        done=False
+        cancelled=False
+        def start(self):pass
+        def poll(self):return self.done,plans if self.done else None,None,"Preparing"
+        def cancel(self):self.cancelled=True
+        def join(self):pass
+    task=Task()
+    planner=_RecordingPlanner()
+    scans=[]
+    class Display:
+        def scan(self,pose):
+            scans.append(pose)
+            return planner.latest_visible_region()
+    monkeypatch.setattr(DynamicRVGRealNavigator,"_new_planner",lambda self:planner)
+    monkeypatch.setattr(DynamicRVGRealNavigator,"_make_preplan_task",lambda self,a,b:task)
+    monkeypatch.setattr(DynamicRVGRealNavigator,"_new_display_visibility",lambda self:Display())
+    controller=_RecordingController()
+    nav=DynamicRVGRealNavigator(
+        WorkspaceConfig(50,30,4.2,4.8,2.1,4.5,4.2,10,30,[3]),controller,[],
+        DynamicRVGSettings(),tmp_path,execution_mode="preplanned",scan_pause=.5)
+    nav.request_goal(30,10);nav.replace_obstacles([])
+    obs=RobotObservation(3,10,10,0)
+    assert nav.process_observation(obs)==Action.stop()
+    assert nav.process_observation(obs)==Action.stop()
+    assert controller.path==[]
+    task.done=True
+    assert nav.process_observation(obs)==Action.stop()
+    assert nav.planning_step==1 and len(scans)==1
+    assert nav.process_observation(obs)==Action.stop()
+    assert controller.path==[]
+    nav._scan_pause_until=0
+    nav.process_observation(obs)
+    controller.car_state.status_label="FINISHED"
+    drifted=RobotObservation(3,19.7,10.1,1)
+    assert nav.process_observation(drifted)==Action.stop()
+    assert nav.needs_plan
+    assert nav.process_observation(drifted)==Action.stop()
+    assert nav.planning_step==2 and scans[-1]==drifted.pose
+    assert nav.current_plan.configurations[0].getX()==20
+    assert planner.events==[]
+    assert list(tmp_path.glob("preplanned_run_*.json"))
+    nav.cancel()
+    assert not nav.recording_run_active()
+    nav.close()
+
+def test_new_goal_discards_cancelled_preplan(monkeypatch,tmp_path):
+    class Task:
+        cancelled=False
+        def start(self):pass
+        def poll(self):return False,None,None,"Preparing"
+        def cancel(self):self.cancelled=True
+        def join(self):pass
+    tasks=[Task(),Task()]
+    sequence=iter(tasks)
+    monkeypatch.setattr(DynamicRVGRealNavigator,"_new_planner",lambda self:_RecordingPlanner())
+    monkeypatch.setattr(DynamicRVGRealNavigator,"_make_preplan_task",lambda self,a,b:next(sequence))
+    nav=DynamicRVGRealNavigator(
+        WorkspaceConfig(50,30,4.2,4.8,2.1,4.5,4.2,10,30,[3]),_RecordingController(),[],
+        DynamicRVGSettings(),tmp_path,execution_mode="preplanned")
+    nav.request_goal(30,10);nav.replace_obstacles([])
+    nav.process_observation(RobotObservation(3,10,10,0))
+    nav.request_goal(35,10)
+    assert tasks[0].cancelled
+    nav.replace_obstacles([])
+    nav.process_observation(RobotObservation(3,10,10,0))
+    assert nav._preplan_task is tasks[1]
+    nav.close()
+    assert tasks[1].cancelled

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
+from dataclasses import asdict, replace
 import math
 import re
 import threading
@@ -23,6 +25,10 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from micromvp.controller import NavigationController
+from micromvp.controller.navigation_controller.pose_path_executor import PosePathExecutor
+from micromvp.planner.dynamic_rvg import PhysicalVisibility
+from micromvp.planner.preplanned import PreplanTask
+from micromvp.utils.motion_log import MotionLog
 from micromvp.core.models import (
     Action,
     CarState,
@@ -45,7 +51,7 @@ from micromvp.planner import (
 _NUMBER_PATTERN = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(*, camera_recording: bool = False) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="DynamicRVG + MicroMVP real-hardware navigation"
     )
@@ -60,6 +66,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Seconds to wait for workspace and robot discovery (default: 10)",
+    )
+    parser.add_argument(
+        "--execution-mode", choices=("live", "preplanned"), default="live",
+        help="Preplanned computes the complete DRVG route before moving",
+    )
+    parser.add_argument(
+        "--preplan-timeout", type=float, default=30.0,
+        help="Maximum preplanning time in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--scan-pause", type=float, default=0.5,
+        help="Stopped display-update time between preplanned segments (default: 0.5)",
     )
     parser.add_argument(
         "--obstacle-capture-seconds",
@@ -147,12 +165,32 @@ def parse_args() -> argparse.Namespace:
         default=Path("navigation_output/dynamic_rvg"),
         help="Directory for per-step planner graph drawings",
     )
-    parser.add_argument(
-        "--no-planner-drawings",
-        action="store_true",
-        help="Do not write the C++ planner graph after each planning step",
+    graph_output = parser.add_mutually_exclusive_group()
+    graph_output.add_argument(
+        "--planner-drawings", dest="no_planner_drawings", action="store_false",
+        help="Save diagnostic graph PNGs; synchronous plotting pauses robot execution",
     )
-    return parser.parse_args()
+    graph_output.add_argument(
+        "--no-planner-drawings", dest="no_planner_drawings", action="store_true",
+        help="Skip diagnostic graph PNGs (default); live overlays remain enabled",
+    )
+    parser.set_defaults(no_planner_drawings=True)
+    if camera_recording:
+        parser.add_argument(
+            "--view", choices=("perspective", "birdseye"), default="perspective",
+            help="Camera view: original perspective or rectangular bird's-eye view",
+        )
+        parser.add_argument(
+            "--record", type=Path, metavar="FILE.mp4",
+            help="Record each goal run as a silent 30 fps MP4; idle time is excluded",
+        )
+    args = parser.parse_args()
+    if camera_recording and args.record is not None:
+        if args.record.suffix.lower() != ".mp4":
+            parser.error("--record requires an .mp4 file")
+        if args.record.exists():
+            parser.error(f"recording already exists: {args.record}")
+    return args
 
 
 def copy_obstacles(
@@ -201,11 +239,30 @@ class DynamicRVGRealNavigator:
         obstacles: Sequence[Sequence[Point]],
         settings: DynamicRVGSettings,
         output_dir: Path,
-        draw_planner_graphs: bool = True,
+        draw_planner_graphs: bool = False,
         goal_heading: float = 0.0,
         obstacle_padding_cm: float = 0.0,
         obstacle_draw_height_cm: float = 0.0,
+        execution_collision_check: bool = False,
+        execution_mode: str = "live",
+        preplan_timeout: float = 30.0,
+        scan_pause: float = 0.5,
     ) -> None:
+        if execution_mode not in {"live", "preplanned"}:
+            raise ValueError("execution_mode must be live or preplanned")
+        if not math.isfinite(preplan_timeout) or preplan_timeout <= 0:
+            raise ValueError("preplan_timeout must be positive")
+        if not math.isfinite(scan_pause) or scan_pause < 0:
+            raise ValueError("scan_pause must be non-negative")
+        self._motion_log = None
+        self.execution_mode = execution_mode
+        self.preplan_timeout = preplan_timeout
+        self.scan_pause = scan_pause
+        self._preplan_task = None
+        self._preplan_jobs = []
+        self._prepared_plans = []
+        self._prepared_index = 0
+        self._scan_pause_until = 0.0
         self.workspace = workspace
         self.controller = controller
         self.settings = settings
@@ -219,11 +276,18 @@ class DynamicRVGRealNavigator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
+        self._display_obstacles = copy_obstacles(obstacles)
         self._fixed_obstacles = pad_obstacles(
-            copy_obstacles(obstacles),
+            self._display_obstacles,
             self.obstacle_padding_cm,
         )
         self.planner = self._new_planner()
+        self.executor = PosePathExecutor(
+            controller, lambda a, b: self.planner.motion_is_valid(a, b),
+            reject_blocked_motion=execution_collision_check,
+            orientation_invariant=settings.robot_footprint == "circle",
+        )
+        self._display_visibility = None
         self._pending_goal: Pose | None = None
         self._goal_waiting_for_obstacle_scan = False
         self._goal_heading = goal_heading % 360.0
@@ -238,7 +302,6 @@ class DynamicRVGRealNavigator:
             tuple[list[Point], list[list[Point]]]
         ] = []
         self.current_plan: DynamicRVGPlan | None = None
-        self._replan_pose_override: Pose | None = None
         self.run_number = 0
         self.planning_step = 0
         self.needs_plan = False
@@ -262,6 +325,47 @@ class DynamicRVGRealNavigator:
             self.settings,
         )
 
+    def _record_motion(self, observation, action, event="sample"):
+        if self._motion_log is not None:
+            self._motion_log.record(
+                observation, action, self.planning_step,
+                self.executor, self.controller.car_state, event,
+            )
+
+    def _close_motion_log(self, reason):
+        if self._motion_log is not None:
+            self._record_motion(self._last_observation, Action.stop(), reason)
+            self._motion_log.close(reason)
+            self._motion_log = None
+
+    def _cancel_preplanning(self):
+        if self._preplan_task is not None:
+            self._preplan_task.cancel()
+            self._preplan_task = None
+        self._prepared_plans = []
+        self._prepared_index = 0
+        self._scan_pause_until = 0.0
+
+    def _make_preplan_task(self, start, goal):
+        workspace = replace(self.workspace, car_id_list=list(self.workspace.car_id_list))
+        obstacles = copy_obstacles(self._fixed_obstacles)
+        settings = self.settings
+        return PreplanTask(
+            lambda: DynamicRVGSession(workspace, obstacles, settings),
+            start, goal, settings.max_iterations, self.preplan_timeout,
+        )
+
+    def close(self):
+        self.cancel("Window closed")
+        for task in self._preplan_jobs:
+            task.cancel()
+            task.join()
+
+    def _new_display_visibility(self):
+        return PhysicalVisibility(
+            self.workspace, self._display_obstacles, self.settings.scan_mode
+        )
+
     def request_goal(self, x: float, y: float) -> bool:
         """Queue a goal that remains stopped until a fresh obstacle scan."""
         with self._lock:
@@ -271,11 +375,13 @@ class DynamicRVGRealNavigator:
             if not (0.0 <= y <= self.workspace.height):
                 self.status_message = f"Rejected goal: y={y:.2f} is outside workspace"
                 return False
+            self._close_motion_log("superseded")
+            self._cancel_preplanning()
             self._pending_goal = (float(x), float(y), self._goal_heading)
             self._goal_waiting_for_obstacle_scan = True
             self.controller.reset()
+            self.executor.reset()
             self.needs_plan = False
-            self._replan_pose_override = None
             self.segment_rotation_active = False
             self.final_segment_active = False
             self.active = False
@@ -312,11 +418,13 @@ class DynamicRVGRealNavigator:
 
     def cancel(self, reason: str = "Run cancelled") -> None:
         with self._lock:
+            self._close_motion_log(reason)
+            self._cancel_preplanning()
             self.controller.reset()
+            self.executor.reset()
             self._pending_goal = None
             self._goal_waiting_for_obstacle_scan = False
             self.needs_plan = False
-            self._replan_pose_override = None
             self.segment_rotation_active = False
             self.final_segment_active = False
             self.active = False
@@ -331,9 +439,11 @@ class DynamicRVGRealNavigator:
         """Replace the fixed world while stopped, discarding planner history."""
         with self._lock:
             self.controller.reset()
+            self.executor.reset()
             previous_obstacles = self._fixed_obstacles
+            next_display_obstacles = copy_obstacles(obstacles)
             next_obstacles = pad_obstacles(
-                copy_obstacles(obstacles),
+                next_display_obstacles,
                 self.obstacle_padding_cm,
             )
             self._fixed_obstacles = next_obstacles
@@ -342,14 +452,16 @@ class DynamicRVGRealNavigator:
             except Exception:
                 self._fixed_obstacles = previous_obstacles
                 raise
+            self._cancel_preplanning()
             self.planner = next_planner
+            self._display_obstacles = next_display_obstacles
+            self._display_visibility = None
             self.goal = None
             self.start_pose = None
             self.trajectory = []
             self.planned_segments = []
             self._scanned_regions = []
             self.current_plan = None
-            self._replan_pose_override = None
             self._goal_waiting_for_obstacle_scan = False
             self.planning_step = 0
             self.needs_plan = False
@@ -373,6 +485,7 @@ class DynamicRVGRealNavigator:
         """Keep the previous safe world after a rejected rescan."""
         with self._lock:
             self.controller.reset()
+            self.executor.reset()
             self.needs_plan = False
             self.active = False
             self.failed = True
@@ -384,8 +497,17 @@ class DynamicRVGRealNavigator:
                 self._status_before_tracking_loss = self.status_message
             self.tracking_lost = True
             self.status_message = "TRACKING LOST - robot stopped"
+            self._record_motion(None, Action.stop(), "tracking_lost")
 
     def process_observation(self, observation: RobotObservation) -> Action:
+        with self._lock:
+            action = self._process_observation(observation)
+            self._record_motion(observation, action)
+            if self.finished or self.failed:
+                self._close_motion_log("goal_reached" if self.finished else "failed")
+            return action
+
+    def _process_observation(self, observation: RobotObservation) -> Action:
         """Consume one real pose and return the next normalized wheel command."""
         with self._lock:
             self._last_observation = observation
@@ -407,52 +529,129 @@ class DynamicRVGRealNavigator:
                 # for initialization.  A later camera frame differs even for
                 # a stationary robot, which leaves the original start vertex
                 # out of the first graph and is reported as CurrentPoseInvalid.
-                self._plan_next_segment(observation)
+                if self.execution_mode == "live":
+                    self._plan_next_segment(observation)
                 return Action.stop()
 
             if not self.active:
                 self.controller.update(observation)
                 return Action.stop()
 
-            planner_pose: Pose | RobotObservation = observation
-            if self.needs_plan and self._replan_pose_override is not None:
-                planner_pose = self._replan_pose_override
-                measured = observation.pose
-                print(
-                    "[DynamicRVG] Actual-size pose is valid; replanning from "
-                    "the planned terminal configuration "
-                    f"({planner_pose[0]:.3f}, {planner_pose[1]:.3f}, "
-                    f"{planner_pose[2]:.2f} deg) instead of measured "
-                    f"({measured[0]:.3f}, {measured[1]:.3f}, "
-                    f"{measured[2]:.2f} deg)"
-                )
-            self.planner.update_pose(planner_pose)
+            if self.execution_mode == "preplanned":
+                return self._process_preplanned(observation)
+
+            self.planner.update_pose(observation)
 
             if self.needs_plan:
                 self._plan_next_segment(observation)
-                self._replan_pose_override = None
                 if self.failed or self.finished:
                     self.controller.update(observation)
                     return Action.stop()
 
-            action = self.controller.step(observation)
-            self.trajectory.append(observation.position)
+            return self._execute_current_segment(observation)
 
-            if (
-                not self.segment_rotation_active
-                and self.controller.car_state.status_label == "FINISHED"
-            ):
-                self._begin_terminal_rotation()
+    def _execute_current_segment(self, observation):
+        try:
+            action = self.executor.step(observation)
+        except ValueError as error:
+            self._reject_motion(error)
+            return Action.stop()
+        self.trajectory.append(observation.position)
+        self.segment_rotation_active = (
+            not self.executor.done
+            and self.executor.motions[self.executor.index].kind == "rotate"
+        )
+        self.status_message = f"Segment {self.planning_step}: {self.executor.status}"
+        if self.executor.done:
+            self._finish_current_segment(observation.pose)
+            return Action.stop()
+        return action
+
+    def _save_preplanned_route(self):
+        path = self.output_dir / f"preplanned_run_{self.run_number:03d}_{time.time_ns()}.json"
+        data = {
+            "execution_mode": "preplanned",
+            "start": self.start_pose, "goal": self.goal,
+            "workspace": asdict(self.workspace), "settings": asdict(self.settings),
+            "obstacles": self._display_obstacles,
+            "obstacle_padding_cm": self.obstacle_padding_cm,
+            "segments": [
+                {
+                    "status": plan.status, "final_segment": plan.final_segment,
+                    "configurations": [
+                        [v.getX(),v.getY(),math.degrees(v.getTheta())%360]
+                        for v in plan.configurations
+                    ],
+                    "controller_path": plan.controller_path,
+                }
+                for plan in self._prepared_plans
+            ],
+        }
+        path.write_text(json.dumps(data,indent=2))
+        if self._motion_log is not None:
+            self._motion_log.set_route_path(path)
+        print(f"[Preplan] Complete route saved: {path}",flush=True)
+
+    def _process_preplanned(self, observation):
+        if self._preplan_task is not None:
+            done,plans,error,progress = self._preplan_task.poll()
+            self.status_message = progress + "; robot stopped"
+            self.controller.update(observation)
+            if not done:
                 return Action.stop()
-
-            if (
-                self.segment_rotation_active
-                and self.controller.car_state.status_label == "ROTATION_DONE"
-            ):
-                self._finish_current_segment(observation.pose)
+            self._preplan_task = None
+            if error is not None:
+                self._reject_motion(RuntimeError(error))
                 return Action.stop()
+            self._prepared_plans = plans
+            self._prepared_index = 0
+            self._save_preplanned_route()
+            if not plans:
+                self._finish_goal(observation.pose)
+                return Action.stop()
+            self.needs_plan = True
+        if self.needs_plan:
+            plan = self._prepared_plans[self._prepared_index]
+            self.current_plan = plan
+            self.planning_step = self._prepared_index + 1
+            self.final_segment_active = plan.final_segment
+            self.planned_segments.append(list(plan.controller_path))
+            self._record_latest_scan_region(observation.pose)
+            try:
+                self.executor.load(plan.configurations)
+            except ValueError as error:
+                self._reject_motion(error)
+                return Action.stop()
+            self.needs_plan = False
+            self._scan_pause_until = time.monotonic() + self.scan_pause
+            self.status_message = (
+                f"Preplanned segment {self.planning_step}/{len(self._prepared_plans)}: "
+                "stopped; visible area updated"
+            )
+            print(f"[Replay] {self.status_message}; measured pose={observation.pose}",flush=True)
+            self.controller.update(observation)
+            return Action.stop()
+        if time.monotonic() < self._scan_pause_until:
+            self.controller.update(observation)
+            return Action.stop()
+        return self._execute_current_segment(observation)
 
-            return action
+    def report_execution_failed(self, error: Exception) -> None:
+        with self._lock:
+            self._reject_motion(error)
+            self._close_motion_log("execution_error")
+
+    def _reject_motion(self, error: Exception) -> None:
+        self._cancel_preplanning()
+        self._pending_goal = None
+        self._goal_waiting_for_obstacle_scan = False
+        self.controller.reset()
+        self.executor.reset()
+        self.active = False
+        self.failed = True
+        self.needs_plan = False
+        self.status_message = f"MOTION BLOCKED - robot stopped: {error}"
+        print(f"[DynamicRVG] {self.status_message}", flush=True)
 
     def _initialize_run(
         self,
@@ -460,10 +659,22 @@ class DynamicRVGRealNavigator:
         goal: Pose,
     ) -> None:
         self.controller.reset()
+        self.executor.reset()
         self.controller.update(observation)
-        self.planner.initialize(observation.pose, goal)
+        if self.execution_mode == "live":
+            self.planner.initialize(observation.pose, goal)
         self._goal_waiting_for_obstacle_scan = False
         self.run_number += 1
+        self._close_motion_log("reinitialized")
+        self._motion_log = MotionLog(self.output_dir,self.run_number,{
+            "goal": list(goal), "start": list(observation.pose),
+            "workspace": asdict(self.workspace), "settings": asdict(self.settings),
+            "obstacles": self._display_obstacles,
+            "obstacle_padding_cm": self.obstacle_padding_cm,
+            "execution_mode": self.execution_mode,
+            "heading_note": "Unwrapped heading restarts after tracking loss or an observation gap over 0.5 seconds.",
+            "command_note": "Commands are generated wheel thrust, not measured motor feedback.",
+        })
         self.planning_step = 0
         self.start_pose = observation.pose
         self.goal = goal
@@ -471,7 +682,6 @@ class DynamicRVGRealNavigator:
         self.planned_segments = []
         self._scanned_regions = []
         self.current_plan = None
-        self._replan_pose_override = None
         self.needs_plan = True
         self.segment_rotation_active = False
         self.final_segment_active = False
@@ -479,27 +689,78 @@ class DynamicRVGRealNavigator:
         self.finished = False
         self.failed = False
         self.status_message = "Goal initialized; robot stopped for planning"
+        if self.execution_mode == "preplanned":
+            self.status_message = "Preparing complete DRVG route; robot stopped"
+            self._preplan_task = self._make_preplan_task(observation.pose, goal)
+            self._preplan_jobs.append(self._preplan_task)
+            self._preplan_task.start()
+
+
+    def _save_invalid_pose_snapshot(self, observation, previous_plan) -> None:
+        """Retain the exact failed scan and planner inputs without changing control."""
+        native = self.planner.planner.latestObservation()
+        terminal = None
+        if previous_plan is not None and previous_plan.configurations:
+            v = previous_plan.configurations[-1]
+            terminal = [v.getX(),v.getY(),math.degrees(v.getTheta()) % 360]
+        data = {
+            "captured_at": time.time(),
+            "workspace": asdict(self.workspace),
+            "pose": list(observation.pose),
+            "goal": self.goal,
+            "previous_planned_terminal": terminal,
+            "obstacles": self._display_obstacles,
+            "obstacle_padding_cm": self.obstacle_padding_cm,
+            "settings": asdict(self.settings),
+            "native_observation": {
+                "success": bool(native.success),
+                "outer": self.planner._polygon_points(native.outerBoundary),
+                "holes": [self.planner._polygon_points(hole) for hole in native.holes],
+            },
+        }
+        directory = Path("diagnostics/drvg/failures")
+        directory.mkdir(parents=True,exist_ok=True)
+        path = directory / f"run_{self.run_number:03d}_step_{self.planning_step:03d}_{time.time_ns()}.json"
+        path.write_text(json.dumps(data,indent=2))
+        print(
+            f"[DynamicRVG] Invalid pose={observation.pose}; previous terminal={terminal}; "
+            f"snapshot={path.resolve()}", flush=True,
+        )
 
     def _plan_next_segment(self, observation: RobotObservation) -> None:
+        previous_plan = self.current_plan
+        planning_started = time.perf_counter()
         plan = self.planner.step()
-        self._record_latest_scan_region()
+        planning_ms = (time.perf_counter() - planning_started) * 1000.0
+        self._record_latest_scan_region(observation.pose)
         self.current_plan = plan
         self.planning_step += 1
         status_name = self._status_name(plan.status)
         print(
             f"[DynamicRVG] run={self.run_number} step={self.planning_step} "
             f"status={status_name} configurations={len(plan.configurations)} "
-            f"controller_points={len(plan.controller_path)}"
+            f"controller_points={len(plan.controller_path)} planning_ms={planning_ms:.1f}"
         )
 
         if self.draw_planner_graphs:
-            self.planner.draw(
+            drawing_started = time.perf_counter()
+            drawn = self.planner.draw(
                 self.output_dir
                 / (
                     f"run_{self.run_number:03d}_"
                     f"step_{self.planning_step:03d}.png"
                 )
             )
+            print(
+                f"[DynamicRVG] diagnostic_plot_ms="
+                f"{(time.perf_counter() - drawing_started) * 1000.0:.1f} saved={drawn}"
+            )
+
+        if status_name == "CurrentPoseInvalid":
+            try:
+                self._save_invalid_pose_snapshot(observation, previous_plan)
+            except Exception as error:
+                print(f"[DynamicRVG] Could not save invalid-pose diagnostic: {error}",flush=True)
 
         if status_name == "GoalReached":
             self._finish_goal(observation.pose)
@@ -514,6 +775,7 @@ class DynamicRVGRealNavigator:
         )
         if not planner_has_path:
             self.controller.reset()
+            self.executor.reset()
             self.active = False
             self.failed = True
             self.needs_plan = False
@@ -538,32 +800,12 @@ class DynamicRVGRealNavigator:
         self.final_segment_active = plan.final_segment
         self.needs_plan = False
 
-        if len(plan.controller_path) > 1:
-            self.controller.set_path(plan.controller_path)
-            self.status_message = (
-                f"{status_name}: executing segment {self.planning_step}"
-            )
+        try:
+            self.executor.load(plan.configurations)
+        except ValueError as error:
+            self._reject_motion(error)
             return
-
-        self._begin_terminal_rotation()
-
-    def _begin_terminal_rotation(self) -> None:
-        if self.current_plan is None or not self.current_plan.configurations:
-            self.controller.reset()
-            self.active = False
-            self.failed = True
-            self.status_message = "PLANNER FAILED - segment has no terminal pose"
-            return
-
-        terminal = self.current_plan.configurations[-1]
-        terminal_heading = math.degrees(terminal.getTheta()) % 360.0
-        self.controller.rotate_to(terminal_heading)
-        self.segment_rotation_active = True
-        destination = "final goal" if self.final_segment_active else "temporary goal"
-        self.status_message = (
-            f"Segment {self.planning_step} position reached; aligning "
-            f"{destination} heading to {terminal_heading:.1f} deg"
-        )
+        self.status_message = f"{status_name}: {self.executor.status}"
 
     def _finish_current_segment(self, pose: Pose) -> None:
         self.segment_rotation_active = False
@@ -571,17 +813,11 @@ class DynamicRVGRealNavigator:
             self._finish_goal(pose)
             return
 
-        if self.current_plan is not None and self.current_plan.configurations:
-            terminal = self.current_plan.configurations[-1]
-            if self.planner.pose_is_valid(
-                pose,
-                robot_geometry_scale=1.0,
-            ):
-                self._replan_pose_override = (
-                    terminal.getX(),
-                    terminal.getY(),
-                    math.degrees(terminal.getTheta()) % 360.0,
-                )
+        if self.execution_mode == "preplanned":
+            self._prepared_index += 1
+            self.needs_plan = True
+            self.status_message = "Preplanned segment complete; stopped for visibility update"
+            return
 
         if self.planner.complete_current_segment():
             self.needs_plan = True
@@ -605,15 +841,16 @@ class DynamicRVGRealNavigator:
         self.finished = True
         self.failed = False
         self.needs_plan = False
-        self._replan_pose_override = None
         self.segment_rotation_active = False
         self.status_message = (
             f"Goal reached: position error {distance:.3f} cm, "
             f"heading error {heading_error:.3f} deg"
         )
 
-    def _record_latest_scan_region(self) -> None:
-        outer_boundary, holes = self.planner.latest_visible_region()
+    def _record_latest_scan_region(self, pose: Pose) -> None:
+        if self._display_visibility is None:
+            self._display_visibility = self._new_display_visibility()
+        outer_boundary, holes = self._display_visibility.scan(pose)
         if not outer_boundary:
             return
         self._scanned_regions.append(
@@ -645,6 +882,13 @@ class DynamicRVGRealNavigator:
             )
             return {state.car_id: state_copy}, self._gui_drawings()
 
+    def recording_run_active(self) -> bool:
+        """A goal owns its video through scanning, planning and execution."""
+        with self._lock:
+            return not (self.finished or self.failed) and (
+                self.active or self._pending_goal is not None
+            )
+
     def summary(self) -> tuple[str, str, str, str, str]:
         with self._lock:
             pose_text = "unavailable"
@@ -659,6 +903,13 @@ class DynamicRVGRealNavigator:
                 if self.run_number
                 else "not initialized"
             )
+            if self.execution_mode == "preplanned":
+                planner_text = (
+                    f"PREPLANNED playback: {self.planning_step}/{len(self._prepared_plans)}"
+                    if self._prepared_plans else
+                    "PREPLANNING full route" if self._preplan_task is not None else
+                    "PREPLANNED mode: waiting for goal"
+                )
             goal_text = "none"
             if self.goal is not None:
                 goal_text = (
@@ -687,6 +938,7 @@ class DynamicRVGRealNavigator:
                 {
                     "uuid": "scanned_area",
                     "type": "region",
+                    "clip_to_workspace": True,
                     "regions": [
                         {"outer": outer, "holes": holes}
                         for outer, holes in self._scanned_regions
@@ -699,7 +951,7 @@ class DynamicRVGRealNavigator:
                 }
             )
 
-        for index, obstacle in enumerate(self._fixed_obstacles):
+        for index, obstacle in enumerate(self._display_obstacles):
             drawing = self._path_drawing(
                 f"fixed_obstacle_{index}",
                 self._closed(obstacle),
@@ -784,18 +1036,6 @@ class DynamicRVGRealNavigator:
             )
 
         state = self.controller.car_state
-        drawings.append(
-            {
-                "uuid": f"selection_indicator_{state.car_id}",
-                "type": "circle",
-                "center": (state.x, state.y),
-                "radius": max(self.workspace.car_width, self.workspace.car_height)
-                * 0.8,
-                "color": "#00AA00" if not self.tracking_lost else "#DD0000",
-                "width": 2,
-            }
-        )
-
         target = state.metadata.get("target_point")
         if target is not None and state.status_label == "FOLLOWING":
             drawings.extend(
@@ -849,8 +1089,9 @@ def main(
     window_factory: Callable[[dict[str, Any], WorkspaceConfig, Any], Any]
     | None = None,
     render_environment: bool = True,
+    camera_recording: bool = False,
 ) -> None:
-    args = parse_args()
+    args = parse_args(camera_recording=camera_recording)
 
     # Keep hardware-only imports after argument parsing so --help works on a
     # development machine without OpenCV, serial, or Qt installed.
@@ -872,8 +1113,11 @@ def main(
     environment = RealEnv(cfg)
 
     print("[main] Starting real environment...")
-    if not environment.start(wait_for_ready=True, timeout=args.timeout):
-        print("[main] Failed to start RealEnv")
+    from micromvp.gui.startup import wait_for_camera_workspace
+
+    if not wait_for_camera_workspace(environment, timeout=args.timeout):
+        print("[main] Startup cancelled or failed; hardware stopped")
+        environment.stop_all()
         environment.close()
         return
 
@@ -934,6 +1178,10 @@ def main(
         who="DynamicRVG real navigation",
     )
     settings = DynamicRVGSettings(
+        robot_footprint=cfg.require(
+            "navigation.robot_footprint", str, who="DynamicRVG real navigation"
+        ),
+        optimal=cfg.require("planner.rvg.optimal", bool, who="DynamicRVG real navigation"),
         resolution=max(
             1,
             configured_resolution
@@ -983,6 +1231,13 @@ def main(
             goal_heading=args.goal_heading,
             obstacle_padding_cm=obstacle_padding_cm,
             obstacle_draw_height_cm=obstacle_draw_height_cm,
+            execution_mode=args.execution_mode,
+            preplan_timeout=args.preplan_timeout,
+            scan_pause=args.scan_pause,
+            execution_collision_check=cfg.require(
+                "navigation.execution_collision_check", bool,
+                who="DynamicRVG real navigation",
+            ),
         )
     except Exception:
         print("[main] Planner startup failed; stopping hardware")
@@ -996,7 +1251,7 @@ def main(
             "workspace_boundary_height_cm": obstacle_draw_height_cm,
         },
         "control_panel": [
-            {"type": "label", "text": "=== Real DynamicRVG ==="},
+            {"type": "label", "text": "=== Preplanned DRVG replay ===" if args.execution_mode == "preplanned" else "=== Real DynamicRVG ==="},
             {
                 "type": "dynamic_label",
                 "title": "Status",
@@ -1064,34 +1319,46 @@ def main(
             {"type": "label", "text": "O: recapture obstacles   Esc: quit"},
             {
                 "type": "label",
-                "text": f"Orange: obstacle + {obstacle_padding_cm:.1f} cm padding",
+                "text": "Orange: physical obstacle outline",
             },
             {"type": "label", "text": "Gold: scanned area"},
             {"type": "label", "text": "Green: plan   Blue: measured path"},
         ],
     }
-    gui = (
-        MVPWindow(gui_config, workspace)
-        if window_factory is None
-        else window_factory(gui_config, workspace, environment)
-    )
+    gui_config["recording_path"] = getattr(args, "record", None)
+    gui_config["camera_view"] = getattr(args, "view", "perspective")
+    try:
+        gui = (
+            MVPWindow(gui_config, workspace)
+            if window_factory is None
+            else window_factory(gui_config, workspace, environment)
+        )
+    except Exception:
+        environment.stop_all()
+        environment.close()
+        raise
     running = threading.Event()
     running.set()
     recapture_requested = threading.Event()
     recapture_generation = 0
     hardware_action_lock = threading.Lock()
 
+    begin_goal_recording = getattr(gui, "begin_goal_recording", lambda: None)
+    end_goal_recording = getattr(gui, "end_goal_recording", lambda: None)
+
     def stop_and_cancel(reason: str) -> None:
         environment.stop_all()
         with hardware_action_lock:
             navigator.cancel(reason)
             environment.stop_all()
+        end_goal_recording()
 
     def on_canvas_click(x: float, y: float) -> None:
         nonlocal recapture_generation
         environment.stop_all()
         with hardware_action_lock:
             if navigator.request_goal(x, y):
+                begin_goal_recording()
                 recapture_generation += 1
                 recapture_requested.set()
             environment.stop_all()
@@ -1104,6 +1371,7 @@ def main(
             recapture_generation += 1
             recapture_requested.set()
             environment.stop_all()
+        end_goal_recording()
 
     def set_overlay_projection_to_floor(enabled: bool) -> None:
         navigator.set_overlay_projection_to_floor(enabled)
@@ -1180,9 +1448,11 @@ def main(
                 if observation is None:
                     navigator.report_tracking_lost()
                 else:
-                    actions[active_robot_id] = navigator.process_observation(
-                        observation
-                    )
+                    try:
+                        actions[active_robot_id] = navigator.process_observation(observation)
+                    except Exception as error:
+                        environment.stop_all()
+                        navigator.report_execution_failed(error)
                 environment.apply_actions(actions)
 
             with observations_lock:
@@ -1217,6 +1487,8 @@ def main(
         gui.update_widget_text("robot_pose", pose)
         gui.update_widget_text("goal_pose", goal)
         gui.update_widget_text("world_status", world)
+        if not navigator.recording_run_active():
+            end_goal_recording()
 
     render_timer = QTimer()
     render_timer.timeout.connect(main_thread_update)
@@ -1228,10 +1500,22 @@ def main(
     print("=" * 64)
     print(f"  Workspace       : {workspace.width:.1f} x {workspace.height:.1f} cm")
     print(f"  Active robot    : {active_robot_id}")
+    print(f"  Optimal RVG     : {settings.optimal}")
+    print(f"  Execution mode  : {args.execution_mode}")
+    print(f"  Footprint       : {settings.robot_footprint}")
+    if navigator.planner.planning_circle_radius is not None:
+        radius = navigator.planner.planning_circle_radius
+        print(f"  Circle radius   : {radius:.2f} cm (diameter {2 * radius:.2f} cm)")
+    print(f"  Search weights  : translation={settings.euclidean_weight:g}, rotation={settings.rotational_weight:g}")
+    print(f"  Execution guard : {navigator.executor.reject_blocked_motion}")
     print(f"  Fixed obstacles : {len(fixed_obstacles)}")
     print(f"  Obstacle padding: {obstacle_padding_cm:.2f} cm")
     print(f"  Goal heading    : {args.goal_heading % 360.0:.1f} deg")
-    print(f"  Planner graphs  : {args.output_dir}")
+    print(
+        "  Planner graphs  : disabled (live overlays enabled)"
+        if args.no_planner_drawings else
+        f"  Planner graphs  : {args.output_dir} (synchronous diagnostic output)"
+    )
     print("  Start a run     : click canvas (performs a full obstacle rescan)")
     print("  Emergency stop  : Space or C")
     print("  Recapture world : O")
@@ -1243,6 +1527,7 @@ def main(
     render_timer.stop()
     environment.stop_all()
     logic_thread.join()
+    navigator.close()
     environment.stop_all()
     environment.close()
     print("[main] Hardware stopped and environment closed")
