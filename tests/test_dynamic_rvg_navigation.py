@@ -581,3 +581,25 @@ def test_new_goal_discards_cancelled_preplan(monkeypatch,tmp_path):
     assert nav._preplan_task is tasks[1]
     nav.close()
     assert tasks[1].cancelled
+
+
+
+def test_discovery_presentation_arguments(monkeypatch):
+    monkeypatch.setattr("sys.argv", [
+        "demo", "--discovery-view", "--setup-seconds", "0",
+        "--blackout-seconds", "0.75", "--unknown-opacity", "0.8",
+    ])
+    args = parse_args(camera_recording=True)
+    assert args.setup_seconds == 0
+    assert args.blackout_seconds == .75
+    assert args.unknown_opacity == .8
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--unknown-opacity", "1.1"), ("--unknown-opacity", "nan"),
+    ("--blackout-seconds", "-1"), ("--blackout-seconds", "inf"),
+])
+def test_invalid_discovery_presentation_arguments(monkeypatch, flag, value):
+    monkeypatch.setattr("sys.argv", ["demo", flag, value])
+    with pytest.raises(SystemExit):
+        parse_args(camera_recording=True)

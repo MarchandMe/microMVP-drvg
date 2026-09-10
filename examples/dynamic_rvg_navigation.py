@@ -177,6 +177,22 @@ def parse_args(*, camera_recording: bool = False) -> argparse.Namespace:
     parser.set_defaults(no_planner_drawings=True)
     if camera_recording:
         parser.add_argument(
+            "--discovery-view", action="store_true",
+            help="Darken unseen space and reveal observed obstacle edges",
+        )
+        parser.add_argument(
+            "--setup-seconds", type=float, default=2.0,
+            help="Full-setup intro before blackout; 0 starts black (default: 2)",
+        )
+        parser.add_argument(
+            "--blackout-seconds", type=float, default=0.5,
+            help="Fully black transition before revealing the first scan (default: 0.5)",
+        )
+        parser.add_argument(
+            "--unknown-opacity", type=float, default=0.85,
+            help="Black opacity of unknown areas: 0 transparent, 1 opaque (default: 0.85)",
+        )
+        parser.add_argument(
             "--view", choices=("perspective", "birdseye"), default="perspective",
             help="Camera view: original perspective or rectangular bird's-eye view",
         )
@@ -185,6 +201,15 @@ def parse_args(*, camera_recording: bool = False) -> argparse.Namespace:
             help="Record each goal run as a silent 30 fps MP4; idle time is excluded",
         )
     args = parser.parse_args()
+    if camera_recording and (not math.isfinite(args.setup_seconds) or args.setup_seconds < 0):
+        parser.error("--setup-seconds must be non-negative")
+
+    if camera_recording:
+        if not math.isfinite(args.blackout_seconds) or args.blackout_seconds < 0:
+            parser.error("--blackout-seconds must be non-negative")
+        if not 0.0 <= args.unknown_opacity <= 1.0:
+            parser.error("--unknown-opacity must be between 0 and 1")
+
     if camera_recording and args.record is not None:
         if args.record.suffix.lower() != ".mp4":
             parser.error("--record requires an .mp4 file")
@@ -247,6 +272,7 @@ class DynamicRVGRealNavigator:
         execution_mode: str = "live",
         preplan_timeout: float = 30.0,
         scan_pause: float = 0.5,
+        discovery_view: bool = False,
     ) -> None:
         if execution_mode not in {"live", "preplanned"}:
             raise ValueError("execution_mode must be live or preplanned")
@@ -254,6 +280,9 @@ class DynamicRVGRealNavigator:
             raise ValueError("preplan_timeout must be positive")
         if not math.isfinite(scan_pause) or scan_pause < 0:
             raise ValueError("scan_pause must be non-negative")
+        self.discovery_view = discovery_view
+        self._discovered_edges = []
+        self._fully_discovered_obstacles = []
         self._motion_log = None
         self.execution_mode = execution_mode
         self.preplan_timeout = preplan_timeout
@@ -860,6 +889,15 @@ class DynamicRVGRealNavigator:
             )
         )
 
+        if self.discovery_view:
+            from micromvp.gui.discovery import discovered_obstacle_edges
+            self._discovered_edges, complete = discovered_obstacle_edges(
+                self._display_obstacles, self._scanned_regions
+            )
+            self._fully_discovered_obstacles = [
+                self._display_obstacles[index] for index in complete
+            ]
+
     def goal_errors(self, pose: Pose) -> tuple[float, float]:
         if self.goal is None:
             return math.inf, math.inf
@@ -943,9 +981,11 @@ class DynamicRVGRealNavigator:
                         {"outer": outer, "holes": holes}
                         for outer, holes in self._scanned_regions
                     ],
-                    "color": "#D6A20B",
-                    "fill": "#40D6A20B",
-                    "width": 1,
+                    "color": "transparent" if self.discovery_view else "#D6A20B",
+                    "fill": "transparent" if self.discovery_view else "#40D6A20B",
+                    "width": 0 if self.discovery_view else 1,
+                    "discovered_edges": self._discovered_edges,
+                    "discovered_obstacles": self._fully_discovered_obstacles,
                     "z": -10,
                     "projection_height_cm": overlay_height_cm,
                 }
@@ -993,29 +1033,34 @@ class DynamicRVGRealNavigator:
                 }
             )
 
-        if self.goal is not None:
+        # Keep the selected goal visible while its initial scan is pending.
+        display_goal = self._pending_goal or self.goal
+        if display_goal is not None:
             drawings.extend(
                 [
                     {
                         "uuid": "run_goal",
                         "type": "point",
-                        "position": self.goal[:2],
+                        "position": display_goal[:2],
                         "radius": 7,
                         "color": "#DD0000",
                         "fill": "#DD0000",
+                        # Above both discovery shade (2000) and blackout (4000).
+                        "z": 5001,
                     },
                     {
                         "uuid": "goal_heading",
                         "type": "line",
-                        "start": self.goal[:2],
+                        "start": display_goal[:2],
                         "end": (
-                            self.goal[0]
-                            + 7.0 * math.cos(math.radians(self.goal[2])),
-                            self.goal[1]
-                            + 7.0 * math.sin(math.radians(self.goal[2])),
+                            display_goal[0]
+                            + 7.0 * math.cos(math.radians(display_goal[2])),
+                            display_goal[1]
+                            + 7.0 * math.sin(math.radians(display_goal[2])),
                         ),
                         "color": "#DD0000",
                         "width": 2,
+                        "z": 5000,
                     },
                 ]
             )
@@ -1234,6 +1279,7 @@ def main(
             execution_mode=args.execution_mode,
             preplan_timeout=args.preplan_timeout,
             scan_pause=args.scan_pause,
+            discovery_view=getattr(args, "discovery_view", False),
             execution_collision_check=cfg.require(
                 "navigation.execution_collision_check", bool,
                 who="DynamicRVG real navigation",
@@ -1321,12 +1367,17 @@ def main(
                 "type": "label",
                 "text": "Orange: physical obstacle outline",
             },
-            {"type": "label", "text": "Gold: scanned area"},
+            {"type": "label", "text": "Dark: undiscovered; orange: observed edges" if getattr(args, "discovery_view", False) else "Gold: scanned area"},
             {"type": "label", "text": "Green: plan   Blue: measured path"},
         ],
     }
     gui_config["recording_path"] = getattr(args, "record", None)
     gui_config["camera_view"] = getattr(args, "view", "perspective")
+    gui_config["discovery_view"] = getattr(args, "discovery_view", False)
+    gui_config["setup_seconds"] = getattr(args, "setup_seconds", 2.0)
+    gui_config["blackout_seconds"] = getattr(args, "blackout_seconds", 0.5)
+    gui_config["unknown_opacity"] = getattr(args, "unknown_opacity", 0.85)
+
     try:
         gui = (
             MVPWindow(gui_config, workspace)
@@ -1358,6 +1409,9 @@ def main(
         environment.stop_all()
         with hardware_action_lock:
             if navigator.request_goal(x, y):
+                end_goal_recording()
+                # Draw the new goal before capturing the first video frame.
+                gui.update(*navigator.snapshot())
                 begin_goal_recording()
                 recapture_generation += 1
                 recapture_requested.set()

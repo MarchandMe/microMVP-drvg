@@ -29,6 +29,8 @@ from PyQt6.QtWidgets import (
 
 from micromvp.core.models import CarState, WorkspaceConfig
 
+from .regions import project_regions
+
 Point = Tuple[float, float]
 
 def load_car_pixmap() -> QPixmap:
@@ -547,28 +549,9 @@ class MVPCanvas(QGraphicsView):
             item.setPath(path)
 
         elif dtype == "region" and isinstance(item, QGraphicsPathItem):
-            combined_path = QPainterPath()
-            for region in drawing.get("regions", []):
-                region_path = QPainterPath()
-                region_path.setFillRule(Qt.FillRule.OddEvenFill)
-                for points in [region.get("outer", [])] + list(
-                    region.get("holes", [])
-                ):
-                    if len(points) < 3:
-                        continue
-                    px0, py0 = self.workspace_to_pixel(
-                        points[0][0], points[0][1]
-                    )
-                    region_path.moveTo(px0, py0)
-                    for x, y in points[1:]:
-                        px, py = self.workspace_to_pixel(x, y)
-                        region_path.lineTo(px, py)
-                    region_path.closeSubpath()
-                if combined_path.isEmpty():
-                    combined_path = region_path
-                else:
-                    combined_path = combined_path.united(region_path)
-            item.setPath(combined_path)
+            item.setPath(project_regions(
+                drawing.get("regions", []), self.workspace_to_pixel
+            ))
 
     # -------------------------------------------------------------------------
     # Interaction

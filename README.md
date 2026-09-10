@@ -552,6 +552,51 @@ The real-hardware command accepts the same `--mode`, `--strategy`,
 information-gain options as the simulation command. Its default
 `graph_merge` mode retains the accumulated graph across measured-pose steps.
 
+### Discovery presentation and optional cropping
+
+Add `--discovery-view` to the camera-overlay command.
+The GUI and recording show the full setup for two seconds, then go fully black
+for half a second before revealing the first scan. If the scan is still pending,
+the black screen waits for it. Unknown areas then use an 85%-opaque black mask,
+so the scene remains faintly visible underneath. Discovered free space stays
+at its normal brightness. Use `--setup-seconds 0` to start directly with black,
+`--blackout-seconds` to adjust the black transition, and `--unknown-opacity`
+between 0 (transparent) and 1 (solid black) to adjust the unknown areas. Only observed obstacle-edge portions are highlighted in orange,
+with a narrow translucent band on their visible side. An obstacle interior is
+revealed with a light tint only once its entire boundary has been observed.
+Discovery accumulates over the run and resets for each new goal.
+The selected goal dot and heading stay fully opaque above the discovery mask,
+including during the initial black transition and while the first scan is pending.
+
+```bash
+PYTHONPATH=/path/to/drvg/code/build-python python examples/dynamic_rvg_navigation_overlay.py \
+  --config config/car_v4.yaml --view birdseye --execution-mode preplanned \
+  --discovery-view --setup-seconds 2 --blackout-seconds 0.5 --unknown-opacity 0.85 \
+  --record recordings/discovery.mp4
+```
+
+Crop workspace-specific distractions afterward using a separate script.
+Choose the pixel trims for that recording; there is no automatic blue-color
+detection and no default workspace crop. For example (adjust these numbers):
+
+```bash
+python examples/crop_recording.py recordings/discovery.mp4 recordings/discovery-cropped.mp4 \
+  --left 80 --right 40 --threads 8
+```
+
+Cropping automatically uses FFmpeg when available, with up to eight decoder
+and encoder threads. It crops directly in the video pipeline without converting
+each frame to a Python RGB array. A system FFmpeg works, or install the bundled
+binary with `uv pip install -e '.[video]'`. The OpenCV backend remains available
+as a fallback; `--backend ffmpeg` requires the fast backend explicitly, and
+`--backend opencv` selects the original loop. The script reports elapsed time
+and frames per second.
+
+This re-encodes a **silent** demo video, preserves its frame rate, and refuses
+to overwrite an existing output. Keep the uncropped master and ensure the
+crop retains the car's complete trajectory. Crop amounts must leave even
+output dimensions for MP4 encoding.
+
 Each initialized goal run also writes `measured_run_*.csv` and a matching
 metadata JSON in the output directory, automatically. The CSV includes
 timestamps, measured axle x/y, wrapped and unwrapped heading, wheel commands,

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer, QRectF
@@ -17,6 +19,7 @@ from PyQt6.QtWidgets import (
 from micromvp.core.models import CarState, WorkspaceConfig
 
 from .canvas import MVPCanvas
+from .regions import project_regions
 from .window import MVPWindow
 
 
@@ -41,7 +44,24 @@ class CameraOverlayCanvas(MVPCanvas):
         parent: Optional[QWidget] = None,
         workspace_boundary_height_cm: float = 0.0,
         birdseye: bool = False,
+        discovery_view: bool = False,
+        setup_seconds: float = 2.0,
+        blackout_seconds: float = 0.5,
+        unknown_opacity: float = 0.85,
     ) -> None:
+        self._discovery_enabled = discovery_view
+        self._setup_seconds = max(0.0, setup_seconds)
+        if not math.isfinite(blackout_seconds) or blackout_seconds < 0:
+            raise ValueError("blackout_seconds must be non-negative")
+        if not 0.0 <= unknown_opacity <= 1.0:
+            raise ValueError("unknown_opacity must be between 0 and 1")
+        self._blackout_seconds = blackout_seconds
+        self._unknown_opacity = unknown_opacity
+        self._blackout_started = None
+        self._discovery_active = False
+        self._discovery_intro_until = 0.0
+        self._discovery_item = None
+        self._discovery_cache = None
         self._birdseye = None
         if birdseye:
             from .birdseye import BirdseyeProjection
@@ -72,6 +92,111 @@ class CameraOverlayCanvas(MVPCanvas):
             Qt.TransformationMode.SmoothTransformation
         )
         self._scene.addItem(self._camera_item)
+        if self._discovery_enabled:
+            self._discovery_item = QGraphicsPixmapItem()
+            self._discovery_item.setZValue(2000)
+            self._discovery_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._discovery_item.setTransformationMode(
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self._discovery_item.hide()
+            self._scene.addItem(self._discovery_item)
+
+
+    def begin_discovery_run(self) -> None:
+        self._discovery_active = True
+        self._blackout_started = None
+        self._discovery_intro_until = time.monotonic() + self._setup_seconds
+        self.update_discovery()
+
+    def update_drawings(self, drawings) -> None:
+        super().update_drawings(drawings)
+        self.update_discovery()
+
+    def _redraw_scene(self) -> None:
+        super()._redraw_scene()
+        self.update_discovery()
+
+    def update_discovery(self) -> None:
+        item = self._discovery_item
+        if item is None:
+            return
+        data = self._last_drawings_data.get("scanned_area")
+        now = time.monotonic()
+        reveal = (
+            self._discovery_active and self._camera_width > 0
+            and now >= self._discovery_intro_until
+        )
+        item.setVisible(reveal)
+        if not reveal:
+            return
+        if self._blackout_started is None:
+            self._blackout_started = now
+        blackout = (
+            now < self._blackout_started + self._blackout_seconds or data is None
+        )
+        # Cover even the workspace outline during the fully black transition.
+        item.setZValue(4000 if blackout else 2000)
+        item.setPos(self._camera_offset_x, self._camera_offset_y)
+        item.setScale(self._camera_scale)
+        cache = (data, self._camera_width, self._camera_height,
+                 self._workspace_boundary_height_cm, blackout, self._unknown_opacity)
+        if cache == self._discovery_cache:
+            return
+
+        if blackout:
+            overlay = QImage(
+                self._camera_width, self._camera_height,
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            overlay.fill(QColor("black"))
+            item.setPixmap(QPixmap.fromImage(overlay))
+            self._discovery_cache = deepcopy(cache)
+            return
+
+        # Paint in native camera pixels. Raster clipping/compositing avoids Qt
+        # Boolean path operations, which can invert nearly coincident borders.
+        height = float(data.get("projection_height_cm", 0.0))
+        project = lambda x, y: self._workspace_to_image(x, y, height)
+        boundary = project_regions([{"outer": [
+            (0, 0), (self._ws_config.width, 0),
+            (self._ws_config.width, self._ws_config.height),
+            (0, self._ws_config.height),
+        ]}], lambda x, y: self._workspace_to_image(
+            x, y, self._workspace_boundary_height_cm
+        ))
+        scans = data.get("regions", [])
+        complete_regions = [
+            {"outer": points} for points in data.get("discovered_obstacles", [])
+        ]
+        seen = project_regions(scans, project)
+        complete = project_regions(complete_regions, project)
+        known = project_regions(list(scans) + complete_regions, project)
+        edges = QPainterPath()
+        for start, end in data.get("discovered_edges", []):
+            edges.moveTo(*project(*start))
+            edges.lineTo(*project(*end))
+
+        overlay = QImage(
+            self._camera_width, self._camera_height,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        overlay.fill(QColor(0, 0, 0, round(255 * self._unknown_opacity)))
+        painter = QPainter(overlay)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setClipPath(boundary)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        painter.fillPath(known, QColor("black"))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.fillPath(complete, QColor(255, 145, 48, 55))
+        painter.save()
+        painter.setClipPath(seen, Qt.ClipOperation.IntersectClip)
+        painter.strokePath(edges, QPen(QColor(255, 145, 48, 65), 10))
+        painter.restore()
+        painter.strokePath(edges, QPen(QColor("#ff9b42"), 3))
+        painter.end()
+        item.setPixmap(QPixmap.fromImage(overlay))
+        self._discovery_cache = deepcopy(cache)
 
     def set_camera_frame(self, frame: Any) -> None:
         """Replace the camera background from a BGR NumPy frame."""
@@ -221,28 +346,10 @@ class CameraOverlayCanvas(MVPCanvas):
         if drawing_type != "region":
             return
 
-        combined_path = QPainterPath()
-        for region in drawing.get("regions", []):
-            region_path = QPainterPath()
-            region_path.setFillRule(Qt.FillRule.OddEvenFill)
-            for points in [region.get("outer", [])] + list(
-                region.get("holes", [])
-            ):
-                if len(points) < 3:
-                    continue
-                px, py = self.workspace_to_pixel_at_height(
-                    points[0][0], points[0][1], height_cm
-                )
-                region_path.moveTo(px, py)
-                for x, y in points[1:]:
-                    px, py = self.workspace_to_pixel_at_height(x, y, height_cm)
-                    region_path.lineTo(px, py)
-                region_path.closeSubpath()
-            if combined_path.isEmpty():
-                combined_path = region_path
-            else:
-                combined_path = combined_path.united(region_path)
-        item.setPath(combined_path)
+        item.setPath(project_regions(
+            drawing.get("regions", []),
+            lambda x, y: self.workspace_to_pixel_at_height(x, y, height_cm),
+        ))
         self._clip_region_to_workspace(item, drawing)
 
     def _clip_region_to_workspace(self, item, drawing) -> None:
@@ -288,7 +395,7 @@ class CameraOverlayCanvas(MVPCanvas):
             boundary.setPen(
                 QPen(QColor(255, 220, 0), 2, Qt.PenStyle.DashLine)
             )
-            boundary.setZValue(100.0)
+            boundary.setZValue(3000.0 if self._discovery_enabled else 100.0)
             self._scene.addItem(boundary)
             self._boundary_rect_item = boundary  # type: ignore[assignment]
 
@@ -357,9 +464,10 @@ class CameraOverlayWindow(MVPWindow):
 
     def begin_goal_recording(self) -> None:
         """Start one video for an accepted goal click, closing any previous run."""
+        self.end_goal_recording()
+        self._canvas.begin_discovery_run()
         if self._recording_path is None:
             return
-        self.end_goal_recording()
         from .video_recorder import OverlayVideoRecorder
 
         while True:
@@ -408,6 +516,10 @@ class CameraOverlayWindow(MVPWindow):
                 canvas_config.get("workspace_boundary_height_cm", 0.0)
             ),
             birdseye=self._gui_config.get("camera_view") == "birdseye",
+            discovery_view=bool(self._gui_config.get("discovery_view", False)),
+            setup_seconds=float(self._gui_config.get("setup_seconds", 2.0)),
+            blackout_seconds=float(self._gui_config.get("blackout_seconds", 0.5)),
+            unknown_opacity=float(self._gui_config.get("unknown_opacity", 0.85)),
         )
 
     def set_workspace_boundary_on_floor(self, enabled: bool) -> None:
@@ -432,6 +544,7 @@ class CameraOverlayWindow(MVPWindow):
             self._latest_frame = None
         if frame is not None:
             self._canvas.set_camera_frame(frame)
+        self._canvas.update_discovery()
         if self._recorder is not None:
             image = self._canvas.recording_image()
             if image is not None:
